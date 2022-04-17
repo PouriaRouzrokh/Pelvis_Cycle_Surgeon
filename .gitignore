@@ -1,2 +1,8 @@
-.vscode
-pcs_workspace.code-workspace
+__pycache__/
+.wandb/
+data/
+weights/
+temp.ipynb
+.ipynb_checkpoints/
+*/__pycache__
+
