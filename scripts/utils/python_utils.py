@@ -77,6 +77,7 @@ def split_data(df: pd.DataFrame,
     
     # Splitting the data
     df = df.copy()
+    df.reset_index(drop=True, inplace=True)
     if y_column is None and group_column is None:
         splitter = skm.sklearnKFold(n_splits=n_splits, shuffle=shuffle, 
                                     random_state=random_state)

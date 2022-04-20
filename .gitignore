@@ -1,6 +1,8 @@
 __pycache__/
 .wandb/
 data/
+archived/
+archived/
 weights/
 temp.ipynb
 .ipynb_checkpoints/
