@@ -4,7 +4,7 @@ data/
 archived/
 archived/
 weights/
-temp.ipynb
+*.ipynb
 .ipynb_checkpoints/
 */__pycache__
 
