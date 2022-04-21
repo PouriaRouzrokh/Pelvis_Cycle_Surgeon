@@ -14,6 +14,7 @@ import monai as mn
 import numpy as np
 import pydicom
 from PIL import Image as PILImage
+from skimage.exposure import equalize_adapthist as sk_clahe
 from skimage.util import invert as sk_invert
 import timm
 import torch
@@ -55,7 +56,7 @@ class LoadCropD(mn.transforms.Transform):
         Returns:
             data_copy (Dict): the transformed data.
         """
-        # Loading, clipping, and standardizing the image data.
+        # Loading the image data.
         data_copy=copy.deepcopy(data)
         dcm = pydicom.dcmread(data_copy['image'])
         img = dcm.pixel_array
@@ -65,11 +66,6 @@ class LoadCropD(mn.transforms.Transform):
             if dcm.PhotometricInterpretation == 'MONOCHROME1':
                 img = sk_invert(img)
                 img -= np.min(img)
-        percentile_low = np.percentile(img, 5)
-        percentile_high = np.percentile(img, 95)
-        img = np.clip(img, percentile_low, percentile_high)
-        img = np.array(img, dtype='float32')
-        img /= img.max()           
         
         # Cropping the image based on the bounding box.
         xmin, ymin, width, height = data_copy['crop_key']
@@ -79,6 +75,17 @@ class LoadCropD(mn.transforms.Transform):
         xmax = min(xmin + width + self.dilation, img.shape[1])
         img = img[ymin:ymax, xmin:xmax]
         
+        # Clipping the image data.
+        percentile_low = np.percentile(img, 5)
+        percentile_high = np.percentile(img, 95)
+        img = np.clip(img, percentile_low, percentile_high)
+        img = np.array(img, dtype='float32')
+        
+        # Making 8bit and Applying the CLAHE algorithm.
+        img = img / np.max(img)
+        img = (img * 255).astype('uint8')
+        img = sk_clahe(img, clip_limit=0.015)
+                
         # Adding the first channel and returning the image.
         img = np.expand_dims(img, axis=-1)
         data_copy["image"]=img

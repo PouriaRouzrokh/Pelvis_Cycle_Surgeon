@@ -74,7 +74,7 @@ class PCSDataSet(torch.utils.data.Dataset):
         pre_df = df[df['STATE'] == 'PRE']
         post_df = df[df['STATE'] == 'POST']
         
-        # Build MONAI transforms.
+        # Build MONAI transforms with augmentatiin.
         Aug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
             monai_utils.PadtoSquareD(keys="image"),
@@ -83,19 +83,25 @@ class PCSDataSet(torch.utils.data.Dataset):
             mn.transforms.RandRotateD(keys="image", mode="bilinear", 
                                         range_x=0.26, prob=0.5),
             mn.transforms.RandZoomD(keys="image", mode="bilinear"),
+            mn.transforms.ScaleIntensityD(keys="image"),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
             mn.transforms.ToTensorD(keys=["image"]),
             mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])
+        
+        # Build MONAI transforms without augmentatiin.
         NoAug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
             monai_utils.PadtoSquareD(keys="image"),
             mn.transforms.ResizeD(keys="image", 
                                     spatial_size=(image_size, image_size)),
+            mn.transforms.ScaleIntensityD(keys="image"),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
             mn.transforms.ToTensorD(keys=["image"]),
             mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])
+        
+        # Choose the appropriate transforms.
         if mode == 'train':
             Ts = Aug_Ts
         else:
