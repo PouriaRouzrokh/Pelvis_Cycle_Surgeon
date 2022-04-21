@@ -3,12 +3,13 @@
 #-------------------------------------------------------------------------------
 
 # Standard built-in modules
+import os
+import shutil
 import warnings
 
 # Third-party modules
 import monai as mn
 import numpy as np
-import os
 import pandas as pd
 import torch
 
@@ -20,6 +21,7 @@ from utils import monai_utils
 #-------------------------------------------------------------------------------
 
 root_path = os.path.dirname(os.path.dirname(__file__))
+sep = os.path.sep
 warnings.filterwarnings("ignore")  
 
 #-------------------------------------------------------------------------------
@@ -27,108 +29,128 @@ warnings.filterwarnings("ignore")
 #-------------------------------------------------------------------------------
 
 #---------------------------------------
-# - F: build_datasets
+# - C: PCSDataSet
 
-def build_datasets(
-    data_index_path: str = \
-        f'{root_path}{os.path.sep}data{os.path.sep}data_index.csv', 
-    image_size: int = 224
-    ) -> list[mn.data.Dataset] :
-    """Use MONAI to build training, validation and test datasets. 
-    
-    Args:
-        data_index_path (str, optional): the path to the data index csv file.
-            Defaults to 'data/data_index.csv'.
-        image_size (int, optional): the output image size for the dataloader, 
-            which would be (image_size * image_size). Defaults to 224.
-
-    Returns:
-       train_dataset(mn.data.Dataset): training dataset.
-       valid_dataset(mn.data.Dataset): validation dataset.
+class PCSDataSet(torch.utils.data.Dataset):
+    """A class for loading a PyTorch dataset for training the CycleGAN
+        model. This class will internally use MONAI PersistentDatasets.
+        Inherits from torch.utils.data.Dataset.
     """
-    # Load the data index csv file.
-    data_index = pd.read_csv(data_index_path)
-   
-    # Build the dataset_dict.
-    data_dict = dict()
-    label_dict = {'PNEUMONIA':1, 'NORMAL':0}
-    for i, row in data_index.iterrows():
-        set_list = data_dict.get(row['file_set'], list())
-        set_list.append({'image': row['file_path'], 
-                        'label': label_dict[row['file_label']]})
-        data_dict[row['file_set']] = set_list
+    def __init__(self, 
+                 data_index_path: str = \
+                     f'{root_path}{sep}data{sep}data_index.csv',
+                 image_size: int = 224,
+                 valid_fold: int = 0,
+                 mode: str = 'train'):
+        """Class constructor.
 
-    # Build MONAI transforms.
-    Aug_Ts = mn.transforms.Compose([
-          mn.transforms.LoadImageD(keys="image"),
-          mn.transforms.EnsureChannelFirstD(keys="image"),
-          monai_utils.EnsureGrayscaleD(keys="image"),
-          mn.transforms.ResizeD(keys="image", 
-                                spatial_size=(image_size, image_size)),
-          mn.transforms.NormalizeIntensityD(keys="image"),
-          mn.transforms.RandRotateD(keys="image", mode="bilinear", 
-                                    range_x=0.26, prob=0.5),
-          mn.transforms.RandZoomD(keys="image", mode="bilinear"),
-          monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
-          mn.transforms.ToTensorD(keys=["image", "label"]),
-          mn.transforms.RepeatChannelD(keys="image", repeats=3),
-          mn.transforms.SelectItemsd(keys=["image", "label"])
-          ])
-    NoAug_Ts = mn.transforms.Compose([
-          mn.transforms.LoadImageD(keys="image"),
-          mn.transforms.EnsureChannelFirstD(keys="image"),
-          monai_utils.EnsureGrayscaleD(keys="image"),
-          mn.transforms.ResizeD(keys="image", 
-                                spatial_size=(image_size, image_size)),
-          mn.transforms.NormalizeIntensityD(keys="image"),
-          monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
-          mn.transforms.ToTensorD(keys=["image", "label"]),
-          mn.transforms.RepeatChannelD(keys="image", repeats=3),
-          mn.transforms.SelectItemsd(keys=["image", "label"])
-          ])
+        Args:
+            data_index_path (str, optional): path to the data_index.csv file. 
+                Defaults to \f'{root_path}{sep}data{sep}data_index.csv'.
+            image_size (int, optional): final size of the images. 
+                Defaults to 224.
+            valid_fold (int, optional): Number of the fold to be used for 
+                validation. Fold -1 will always be the test set. All other folds
+                build the training set together. Defaults to 0.
+            mode (str, optional): Whether to build the training, validation, or
+                test datasets. Defaults to 'train'.
 
-    # Build MONAI datasets.
-    train_dataset = mn.data.Dataset(data_dict['train'], transform=Aug_Ts)
-    valid_dataset = mn.data.Dataset(data_dict['test'], transform=NoAug_Ts)
+        Raises:
+            ValueError: If mode is not 'train', 'valid', or 'test'.
+        """
+        super().__init__()
+        
+        # Load the data index csv file and split it into pre- and post- 
+        # dataframes.
+        df = pd.read_csv(data_index_path)
+        if mode == 'valid':
+            df = df[df['Fold'] == valid_fold]        
+        elif mode=='train': 
+            df = df[~df["Fold"].isin([-1, valid_fold])]
+        elif mode=='test':
+            df = df[df['Fold'] == -1]
+        else:
+            raise ValueError('The "mode" should be "train", "valid" or "test"!')
+        pre_df = df[df['STATE'] == 'PRE']
+        post_df = df[df['STATE'] == 'POST']
+        
+        # Build MONAI transforms.
+        Aug_Ts = mn.transforms.Compose([
+            monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
+            monai_utils.PadtoSquareD(keys="image"),
+            mn.transforms.ResizeD(keys="image", 
+                                    spatial_size=(image_size, image_size)),
+            mn.transforms.RandRotateD(keys="image", mode="bilinear", 
+                                        range_x=0.26, prob=0.5),
+            mn.transforms.RandZoomD(keys="image", mode="bilinear"),
+            monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
+            mn.transforms.ToTensorD(keys=["image"]),
+            mn.transforms.RepeatChannelD(keys="image", repeats=3),
+            ])
+        NoAug_Ts = mn.transforms.Compose([
+            monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
+            monai_utils.PadtoSquareD(keys="image"),
+            mn.transforms.ResizeD(keys="image", 
+                                    spatial_size=(image_size, image_size)),
+            monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
+            mn.transforms.ToTensorD(keys=["image"]),
+            mn.transforms.RepeatChannelD(keys="image", repeats=3),
+            ])
+        if mode == 'train':
+            Ts = Aug_Ts
+        else:
+            Ts = NoAug_Ts
+        
+        # Build data dictionaries to be fed into MONAI PersistentDatasets.
+        pre_dict = [{'image': pre_df.iloc[i]['DICOM_Path'],
+                     'crop_key': [pre_df.iloc[i]['X_min'],
+                                  pre_df.iloc[i]['Y_min'],
+                                  pre_df.iloc[i]['Width'],
+                                  pre_df.iloc[i]['Height']]} \
+            for i in range(len(pre_df))]
+        post_dict = [{'image': post_df.iloc[i]['DICOM_Path'],
+                      'crop_key': [post_df.iloc[i]['X_min'],
+                                   post_df.iloc[i]['Y_min'],
+                                   post_df.iloc[i]['Width'],
+                                   post_df.iloc[i]['Height']]} \
+            for i in range(len(post_df))]
+        
+        # Preparing the cache dirs.
+        pre_cache_dir = f'{sep}scratch{sep}projects{sep}'\
+                        f'm221279_Pouria{sep}PCS{sep}{mode}_pre_cache'
+        post_cache_dir = f'{sep}scratch{sep}projects{sep}'\
+                         f'm221279_Pouria{sep}PCS{sep}{mode}_post_cache'
+        shutil.rmtree(pre_cache_dir, ignore_errors=True)
+        shutil.rmtree(post_cache_dir, ignore_errors=True)
+        os.makedirs(pre_cache_dir, exist_ok=True)
+        os.makedirs(post_cache_dir, exist_ok=True)
 
-    return train_dataset, valid_dataset
-
-#-------------------------------------------------------------------------------
-# Oversampling tools
-#-------------------------------------------------------------------------------
-
-#---------------------------------------
-# - F: build_datasets
-
-def get_oversampling_sampler(dataset: mn.data.Dataset,
-                            label_key: str = 'label',
-                            )-> torch.utils.data.sampler.WeightedRandomSampler:
-    """Create a sampler that oversamples the minority classes.
-
-    Args:
-        dataset (torch.utils.data.mn.data.Dataset): the input dataset (built as a 
-            MONAI dictionary dataset.)
-        label_key (str, optional): the key for data label in the MONAI 
-            dictionary dataset. Defaults to 'label'.
-
-    Returns:
-        oversampling_sampler (torch.utils.data.sampler.WeightedRandomSampler): 
-            the oversampling sampler that should be passed to DataLoader or the 
-            DistributedProxySampler constructors.
-    """
-    # Load the 'class_weight_dict' or build one from the dataset.
-    labels = np.array([data[label_key] for data in dataset.data])
-    class_weight_dict = {}
-    train_label_np = np.array(labels)
-    class_labels, class_counts = np.unique(train_label_np, 
-                                            return_counts=True)
-    majority_class_count = max(class_counts)
-    for i, class_label in enumerate(class_labels):
-        class_weight_dict[class_label] = majority_class_count/class_counts[i]
+        # Build MONAI PersistentDatasets.
+        self.pre_dataset = mn.data.PersistentDataset(pre_dict, 
+                                                     cache_dir=pre_cache_dir, 
+                                                     transform=Ts)
+        self.post_dataset = mn.data.PersistentDataset(post_dict, 
+                                                     cache_dir=post_cache_dir, 
+                                                     transform=Ts)
+            
+    def __len__(self):
+        """Returns the length of the dataset."""
+        return max(len(self.pre_dataset), len(self.post_dataset))
     
-    # Build the oversampling_sampler.
-    sample_weights=[class_weight_dict[class_label] for class_label in labels]
-    oversampling_sampler= torch.utils.data.WeightedRandomSampler(
-        sample_weights, num_samples=len(dataset), replacement=True)
-    return oversampling_sampler
+    def __getitem__(self, index: int) -> dict:
+        """Returns the torch tensors for one pre-op Xray and one post-op Xray at 
+        the given index.
+
+        Args:
+            index (int): The index to be used.
+
+        Returns:
+            {'pre': pre_img, 'post': post_img} (dict): A dict of torch tensors
+                to be returned.
+        """
+        pre_index = index % len(self.pre_dataset)
+        post_index = index % len(self.post_dataset)  
+        pre_img = self.pre_dataset[pre_index]['image']
+        post_img = self.post_dataset[post_index]['image']
+        return {'pre': pre_img, 'post': post_img}
 

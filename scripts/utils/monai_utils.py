@@ -12,7 +12,9 @@ import warnings
 # Third-party modules
 import monai as mn
 import numpy as np
+import pydicom
 from PIL import Image as PILImage
+from skimage.util import invert as sk_invert
 import timm
 import torch
 
@@ -25,6 +27,105 @@ warnings.filterwarnings("ignore")
 #-------------------------------------------------------------------------------
 # Custom MONAI transforms
 #-------------------------------------------------------------------------------
+
+#---------------------------------------
+# - C: LoadCropD
+
+class LoadCropD(mn.transforms.Transform):
+    """A MONAI transform to load DICOM files using Pydicom.
+    """
+    def __init__(self, keys:list[str], dilation: int=0) -> None:
+        """Initialize the transform.
+        
+        Args: 
+            keys (list(str)): the input MONAI keys to the transformation class.
+            dilation (int, optional): the dilation value for the bounding box.
+                Defaults to 0.
+        """
+        super().__init__()
+        self.keys=keys
+        self.dilation = dilation
+
+    def __call__(self, data: dict) -> dict:
+        """Body of the transformation.
+        
+        Args:
+            data (Dict): a dictionary of data to be transformed with MONAI.
+        
+        Returns:
+            data_copy (Dict): the transformed data.
+        """
+        # Loading, clipping, and standardizing the image data.
+        data_copy=copy.deepcopy(data)
+        dcm = pydicom.dcmread(data_copy['image'])
+        img = dcm.pixel_array
+        if img.shape[-1] == 3:
+            img = np.mean(img, axis=-1)
+        if 'PhotometricInterpretation' in dcm.dir():
+            if dcm.PhotometricInterpretation == 'MONOCHROME1':
+                img = sk_invert(img)
+                img -= np.min(img)
+        percentile_low = np.percentile(img, 5)
+        percentile_high = np.percentile(img, 95)
+        img = np.clip(img, percentile_low, percentile_high)
+        img = np.array(img, dtype='float32')
+        img /= img.max()           
+        
+        # Cropping the image based on the bounding box.
+        xmin, ymin, width, height = data_copy['crop_key']
+        ymin = max(ymin - self.dilation, 0)
+        ymax = min(ymin + height + self.dilation, img.shape[0])
+        xmin = max(xmin - self.dilation, 0)
+        xmax = min(xmin + width + self.dilation, img.shape[1])
+        img = img[ymin:ymax, xmin:xmax]
+        
+        # Adding the first channel and returning the image.
+        img = np.expand_dims(img, axis=-1)
+        data_copy["image"]=img
+        return data_copy
+
+#---------------------------------------
+# - C: PadtoSquareD
+
+class PadtoSquareD(mn.transforms.Transform):
+    """A MONAI transform to pad an input image to square.
+    """
+    def __init__(self, keys:list[str]) -> None:
+        """Initialize the transform.
+        
+        Args: 
+            keys (list(str)): the input MONAI keys to the transformation class.
+        """
+        super().__init__()
+        self.keys=keys
+
+    def __call__(self, data: dict) -> dict:
+        """Body of the transformation.
+        
+        Args:
+            data (Dict): a dictionary of data to be transformed with MONAI.
+        
+        Returns:
+            data_copy (Dict): the transformed data.
+        """
+        data_copy=copy.deepcopy(data)
+        for key in data:
+            if key in self.keys:
+                img=data[key].copy().squeeze()
+                height, width = img.shape
+                if height < width: 
+                    padded_img = np.zeros((width, width))
+                    delta = (width - height) // 2
+                    padded_img[delta:height+delta, :] = img
+                    img = padded_img
+                elif height > width:
+                    padded_img = np.zeros((height, height))
+                    delta = (height - width) // 2
+                    padded_img[:, delta:width+delta] = img
+                    img = padded_img
+                data_copy[key]=np.expand_dims(img, axis=0)
+        return data_copy
+    
 
 #---------------------------------------
 # - C: EnsureGrayscaleD
@@ -98,7 +199,6 @@ class TransposeD(mn.transforms.Transform):
                 img=data[key].copy()
                 data_copy[key]=self.transposer(img)
                 data_copy[key]=img
-                
         return data_copy
 
 #---------------------------------------
@@ -146,7 +246,9 @@ class ConvertToPIL(mn.transforms.Transform):
             elif len(img.shape)==3:
                 if img.shape[-1]==3:
                     img = np.mean(img, axis=-1)
-        img = PILImage.fromarray(img.astype('uint8'), self.mode)
+        img = img * 255
+        img = img.astype('uint8')
+        img = PILImage.fromarray(img, self.mode)
         return img
 
 #---------------------------------------
@@ -195,7 +297,8 @@ class RandAugD(mn.transforms.RandomizableTransform):
             'TranslateYRel',
         ]
         self.augmentor = timm.data.auto_augment.rand_augment_transform(
-            config_str=f"rand-n{n}-m{m}-mstd{mstd}", hparams={})
+            config_str=f"rand-n{n}-m{m}-mstd{mstd}", 
+            hparams={'img_mean': 0})
         
     def __call__(self, data: dict) -> dict:
         """Body of the transformation.
@@ -214,6 +317,8 @@ class RandAugD(mn.transforms.RandomizableTransform):
                 img = self.augmentor(img)
                 if self.convert_to_numpy:
                     img = np.array(img) 
+                    img = np.mean(img, axis=-1)
+                    img = np.expand_dims(img, axis=0)
                 data_copy[key] = img
         return data_copy
 
