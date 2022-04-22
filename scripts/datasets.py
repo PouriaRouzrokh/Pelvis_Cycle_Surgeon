@@ -74,17 +74,31 @@ class PCSDataSet(torch.utils.data.Dataset):
         pre_df = df[df['STATE'] == 'PRE']
         post_df = df[df['STATE'] == 'POST']
         
+        # - For MR: Standardize based on the volume level then scale to 0 - 1. 
+        # - For CT: Window to the desired range of HU then scale to 0 - 1.
+        # - For XR: Standardize based on the image/population level then 
+        # scale to 0 - 1. 
+        # - Standardize without the zero-pixels. 
+        # - First standardize then pad.
+        # - Standardize before the augmentations but scale after those.
+        # - MR has 7-bit of data. CT has more but if you window it accuratley,
+        # you can get < 8 bit of data. For XR, the data is already < 8 bit.
+        # "L" in Pillow denots 16-bit grayscale.
+
         # Build MONAI transforms with augmentatiin.
         Aug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
-            monai_utils.PadtoSquareD(keys="image"),
-            mn.transforms.ResizeD(keys="image", 
-                                    spatial_size=(image_size, image_size)),
-            mn.transforms.RandRotateD(keys="image", mode="bilinear", 
-                                        range_x=0.26, prob=0.5),
-            mn.transforms.RandZoomD(keys="image", mode="bilinear"),
+            mn.transforms.NormalizeIntensityD(keys=["image"]),
             mn.transforms.ScaleIntensityD(keys="image"),
+            monai_utils.PadtoSquareD(keys="image"),
+            monai_utils.CLAHED(keys="image"),
+            mn.transforms.ResizeD(keys="image", 
+                        spatial_size=(image_size, image_size)),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
+            monai_utils.RandAugD(keys="image"),
+            mn.transforms.RandZoomD(keys="image", mode="bilinear"),
+            mn.transforms.RandFlipD(keys="image", prob=0.5, spatial_axis=1),
+            mn.transforms.ScaleIntensityD(keys="image"),
             mn.transforms.ToTensorD(keys=["image"]),
             mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])
@@ -92,11 +106,14 @@ class PCSDataSet(torch.utils.data.Dataset):
         # Build MONAI transforms without augmentatiin.
         NoAug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
-            monai_utils.PadtoSquareD(keys="image"),
-            mn.transforms.ResizeD(keys="image", 
-                                    spatial_size=(image_size, image_size)),
+            mn.transforms.NormalizeIntensityD(keys=["image"]),
             mn.transforms.ScaleIntensityD(keys="image"),
+            monai_utils.PadtoSquareD(keys="image"),
+            monai_utils.CLAHED(keys="image"),
+            mn.transforms.ResizeD(keys="image", 
+                        spatial_size=(image_size, image_size)),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
+            mn.transforms.ScaleIntensityD(keys="image"),
             mn.transforms.ToTensorD(keys=["image"]),
             mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])

@@ -10,6 +10,7 @@ from typing import Union
 import warnings
 
 # Third-party modules
+import cv2
 import monai as mn
 import numpy as np
 import pydicom
@@ -80,11 +81,6 @@ class LoadCropD(mn.transforms.Transform):
         percentile_high = np.percentile(img, 95)
         img = np.clip(img, percentile_low, percentile_high)
         img = np.array(img, dtype='float32')
-        
-        # Making 8bit and Applying the CLAHE algorithm.
-        img = img / np.max(img)
-        img = (img * 255).astype('uint8')
-        img = sk_clahe(img, clip_limit=0.015)
                 
         # Adding the first channel and returning the image.
         img = np.expand_dims(img, axis=-1)
@@ -133,6 +129,47 @@ class PadtoSquareD(mn.transforms.Transform):
                 data_copy[key]=np.expand_dims(img, axis=0)
         return data_copy
     
+#---------------------------------------
+# - C: CLAHED
+
+class CLAHED(mn.transforms.Transform):
+    """A MONAI transform to Apply Contrast Limited Adaptive Histogram 
+    Equalization (CLAHE).
+    """
+    def __init__(self, keys:list[str]) -> None:
+        """Initialize the transform.
+        
+        Args: 
+            keys (list(str)): the input MONAI keys to the transformation class.
+        """
+        super().__init__()
+        self.keys=keys
+
+    def __call__(self, data: dict) -> dict:
+        """Body of the transformation.
+        
+        Args:
+            data (Dict): a dictionary of data to be transformed with MONAI.
+        
+        Returns:
+            data_copy (Dict): the transformed data.
+        """
+        data_copy=copy.deepcopy(data)
+        for key in data:
+            if key in self.keys:
+                img=data[key].copy()
+                
+                # Making 8bit and Applying the CLAHE algorithm.
+                if img.dtype != np.dtype('uint8'):
+                    img = img / np.max(img)
+                    img = (img * 255).astype('uint8')
+                img = sk_clahe(img, clip_limit=0.011)
+                
+                # Converting back to float32.
+                img = (img / img.max()).astype(np.float32)
+                data_copy[key]=img
+        
+        return data_copy
 
 #---------------------------------------
 # - C: EnsureGrayscaleD
@@ -253,6 +290,12 @@ class ConvertToPIL(mn.transforms.Transform):
             elif len(img.shape)==3:
                 if img.shape[-1]==3:
                     img = np.mean(img, axis=-1)
+                elif img.shape[0]==1:
+                    img = img.transpose(1,2,0)
+                elif img.shape[0]==3:
+                    img = np.mean(img, axis=0)
+                    img = img.transpose(1,2,0)
+        
         img = img * 255
         img = img.astype('uint8')
         img = PILImage.fromarray(img, self.mode)
@@ -267,7 +310,7 @@ class RandAugD(mn.transforms.RandomizableTransform):
     def __init__(self, 
                  keys:list[str], 
                  pil_conversion_mode:str = "RGB", 
-                 m:int=9, n:int=2, mstd:float=0.5, 
+                 m:int=5, n:int=2, mstd:float=0.5, 
                  convert_to_numpy:bool=True) -> None:
         """Initialize the transform.
 
@@ -349,3 +392,7 @@ def empty_monai_cache(cache_dir:str) -> None:
     if os.path.exists(cache_dir+"/val"):
         shutil.rmtree(cache_dir+"/val")
         print("MOANI's validation cache directory removed successfully!")
+        
+    if os.path.exists(cache_dir+"/test"):
+        shutil.rmtree(cache_dir+"/test")
+        print("MOANI's test cache directory removed successfully!")
