@@ -10,7 +10,6 @@ from typing import Union
 import warnings
 
 # Third-party modules
-import cv2
 import monai as mn
 import numpy as np
 import pydicom

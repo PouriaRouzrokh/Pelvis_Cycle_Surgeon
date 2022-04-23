@@ -41,6 +41,8 @@ class PCSDataSet(torch.utils.data.Dataset):
                      f'{root_path}{sep}data{sep}data_index.csv',
                  image_size: int = 224,
                  valid_fold: int = 0,
+                 train_size: int = -1,
+                 valid_size: int = -1,
                  mode: str = 'train'):
         """Class constructor.
 
@@ -52,6 +54,10 @@ class PCSDataSet(torch.utils.data.Dataset):
             valid_fold (int, optional): Number of the fold to be used for 
                 validation. Fold -1 will always be the test set. All other folds
                 build the training set together. Defaults to 0.
+            train_size (int, optional): Number of training samples to use for 
+                building the dataset. Defalults to -1, which means to use all.
+            valid_size (int, optional): Number of validation samples to use for 
+                building the dataset. Defalults to -1, which means to use all.
             mode (str, optional): Whether to build the training, validation, or
                 test datasets. Defaults to 'train'.
 
@@ -60,8 +66,7 @@ class PCSDataSet(torch.utils.data.Dataset):
         """
         super().__init__()
         
-        # Load the data index csv file and split it into pre- and post- 
-        # dataframes.
+        # Open the data index csv file and load the right set.
         df = pd.read_csv(data_index_path)
         if mode == 'valid':
             df = df[df['Fold'] == valid_fold]        
@@ -71,8 +76,27 @@ class PCSDataSet(torch.utils.data.Dataset):
             df = df[df['Fold'] == -1]
         else:
             raise ValueError('The "mode" should be "train", "valid" or "test"!')
-        pre_df = df[df['STATE'] == 'PRE']
-        post_df = df[df['STATE'] == 'POST']
+        
+        # Find out how many images should be collected.
+        if mode == 'train':
+            size = train_size
+            if size == -1 or size > len(df):
+                size = len(df)
+            elif size < 100:
+                raise ValueError('The "train_size" should be at least 100!')
+        elif mode == 'valid':
+            size = valid_size
+            if size == -1 or size > len(df):
+                size = len(df)
+            elif size < 100:
+                raise ValueError('The "valid_size" should be at least 100!')
+        
+        # Building separate dataframes for pre-op and post-op images.
+        pre_df = df[df['STATE'] == 'PRE'][:int(size/2)]
+        post_df = df[df['STATE'] == 'POST'][:int(size/2)]
+        print(size, len(pre_df), len(post_df))
+
+        # Build MONAI transforms with augmentations.
         
         # - For MR: Standardize based on the volume level then scale to 0 - 1. 
         # - For CT: Window to the desired range of HU then scale to 0 - 1.
@@ -84,8 +108,7 @@ class PCSDataSet(torch.utils.data.Dataset):
         # - MR has 7-bit of data. CT has more but if you window it accuratley,
         # you can get < 8 bit of data. For XR, the data is already < 8 bit.
         # "L" in Pillow denots 16-bit grayscale.
-
-        # Build MONAI transforms with augmentatiin.
+        
         Aug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
             mn.transforms.NormalizeIntensityD(keys=["image"]),
@@ -125,13 +148,13 @@ class PCSDataSet(torch.utils.data.Dataset):
             Ts = NoAug_Ts
         
         # Build data dictionaries to be fed into MONAI PersistentDatasets.
-        pre_dict = [{'image': pre_df.iloc[i]['DICOM_Path'],
+        pre_dicts = [{'image': pre_df.iloc[i]['DICOM_Path'],
                      'crop_key': [pre_df.iloc[i]['X_min'],
                                   pre_df.iloc[i]['Y_min'],
                                   pre_df.iloc[i]['Width'],
                                   pre_df.iloc[i]['Height']]} \
             for i in range(len(pre_df))]
-        post_dict = [{'image': post_df.iloc[i]['DICOM_Path'],
+        post_dicts = [{'image': post_df.iloc[i]['DICOM_Path'],
                       'crop_key': [post_df.iloc[i]['X_min'],
                                    post_df.iloc[i]['Y_min'],
                                    post_df.iloc[i]['Width'],
@@ -149,10 +172,10 @@ class PCSDataSet(torch.utils.data.Dataset):
         os.makedirs(post_cache_dir, exist_ok=True)
 
         # Build MONAI PersistentDatasets.
-        self.pre_dataset = mn.data.PersistentDataset(pre_dict, 
+        self.pre_dataset = mn.data.PersistentDataset(pre_dicts, 
                                                      cache_dir=pre_cache_dir, 
                                                      transform=Ts)
-        self.post_dataset = mn.data.PersistentDataset(post_dict, 
+        self.post_dataset = mn.data.PersistentDataset(post_dicts, 
                                                      cache_dir=post_cache_dir, 
                                                      transform=Ts)
             

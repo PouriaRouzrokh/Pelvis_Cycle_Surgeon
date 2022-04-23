@@ -3,16 +3,19 @@
 #-------------------------------------------------------------------------------
 
 # Standard built-in modules
-from typing import Callable
+import os
+import sys
 import warnings
 
 # Third-party modules
 import torch
 import torch.nn as nn
-import torchvision
 
 # Local modules
-from utils.pytorch_utils import make_determinate
+# Adding the root direcory of the project to the path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_path = os.path.dirname(current_dir)
+sys.path.append(root_path)
 
 #-------------------------------------------------------------------------------
 # Configurations
@@ -22,16 +25,17 @@ warnings.filterwarnings("ignore")
 
 #-------------------------------------------------------------------------------
 # Generating the Baseline CycleGAN Model.
-# See: https://www.youtube.com/watch?v=4LktBHGCNfw
+# Original paper: https://arxiv.org/abs/1703.10593
+# Implemented based on: https://www.youtube.com/watch?v=4LktBHGCNfw
 #-------------------------------------------------------------------------------
 
 #---------------------------------------
 #- Discriminator 
 
 #---------------------------------------
-#-- C: CGDiscConvBLock 
+#-- C: DiscConvBLock 
 
-class CGDiscConvBLock(nn.Module):
+class DiscConvBLock(nn.Module):
     """Discriminator block for BaseCGDiscriminator."""
     def __init__(self, in_channels: int, out_channels: int, stride: int):
         """ Class constructor.
@@ -62,9 +66,9 @@ class CGDiscConvBLock(nn.Module):
         return output
 
 #---------------------------------------
-#-- C: CGDiscriminator 
+#-- C: Discriminator 
 
-class CGDiscriminator(nn.Module):
+class Discriminator(nn.Module):
     """Discriminator model for the original Cycle GAN."""
     def __init__(self, in_channels: int = 3, 
                  features: list = [64, 128, 256, 512]):
@@ -89,7 +93,7 @@ class CGDiscriminator(nn.Module):
         layers = list()
         in_channels = features[0]
         for feature in features[1:]:
-            layers.append(CGDiscConvBLock(in_channels, 
+            layers.append(DiscConvBLock(in_channels, 
                                           feature, 
                                           stride = 1 if feature==features[-1] \
                                               else 2))
@@ -117,9 +121,9 @@ class CGDiscriminator(nn.Module):
 #- Generator  
 
 #---------------------------------------
-#-- C: CGGenConvBLock 
+#-- C: GenConvBLock 
 
-class CGGenConvBLock(nn.Module):
+class GenConvBLock(nn.Module):
     """Generator block for the BaseCGGenerator."""
     def __init__(self, in_channels: int, out_channels: int, down: bool = True,
                  use_act: bool = True, **kwargs):
@@ -154,9 +158,9 @@ class CGGenConvBLock(nn.Module):
         return output
     
 #---------------------------------------
-#-- C: CGGenResBLock 
+#-- C: GenResBLock 
 
-class CGGenResBLock(nn.Module):
+class GenResBLock(nn.Module):
     """Residual block for the BaseCGGenerator."""
     def __init__(self, channels: int):
         """Class constructor.
@@ -170,8 +174,8 @@ class CGGenResBLock(nn.Module):
         """
         super().__init__()
         self.block = nn.Sequential(
-            CGGenConvBLock(channels, channels, kernel_size=3, padding=1),
-            CGGenConvBLock(channels, channels, kernel_size=3, padding=1,
+            GenConvBLock(channels, channels, kernel_size=3, padding=1),
+            GenConvBLock(channels, channels, kernel_size=3, padding=1,
                             use_act=False)
         )
         
@@ -187,9 +191,9 @@ class CGGenResBLock(nn.Module):
         return x + self.block(x)
     
 #---------------------------------------
-#-- C: CGGenerator
+#-- C: Generator
 
-class CGGenerator(nn.Module):
+class Generator(nn.Module):
     """Generator model for the original Cycle GAN."""
     def __init__(self, img_channels: int = 3, num_features: int = 64,
                  num_residuals: int = 9):
@@ -211,25 +215,25 @@ class CGGenerator(nn.Module):
         # Down sampling layers.
         self.down_blocks = nn.ModuleList(
             [
-                CGGenConvBLock(num_features, num_features*2, down=True,
+                GenConvBLock(num_features, num_features*2, down=True,
                                kernel_size=3, stride=2, padding=1),
-                CGGenConvBLock(num_features*2, num_features*4, down=True,
+                GenConvBLock(num_features*2, num_features*4, down=True,
                                kernel_size=3, stride=2, padding=1),
             ]
         )
         
         # Residual blocks.
         self.residual_blocks = nn.Sequential(
-            *[CGGenResBLock(num_features*4) for _ in range(num_residuals)]
+            *[GenResBLock(num_features*4) for _ in range(num_residuals)]
         )
         
         # Up sampling layers.
         self.up_blocks = nn.ModuleList(
             [
-                CGGenConvBLock(num_features*4, num_features*2, down=False,
+                GenConvBLock(num_features*4, num_features*2, down=False,
                                kernel_size=3, stride=2, padding=1, 
                                output_padding=1),
-                CGGenConvBLock(num_features*2, num_features, down=False,
+                GenConvBLock(num_features*2, num_features, down=False,
                                kernel_size=3, stride=2, padding=1,  
                                output_padding=1),  
             ]
