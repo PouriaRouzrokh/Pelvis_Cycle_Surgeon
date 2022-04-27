@@ -461,7 +461,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
     
     train_dataset = datasets.PCSDataSet(mode='train', 
                                         # train_size=5000,
-                                        cache_dir_tag = 'sample_run',
+                                        cache_dir_tag = 'full_run',
                                         remove_cache=True)
         
     if is_ddp: 
@@ -763,7 +763,7 @@ def train_one_epoch(train_loader: Iterable,
                                                     identity_pre, label='pre')
                 fig_pre = pytorch_utils.plot_images(real_post, fake_pre, 
                                                     identity_post, label='post')
-                wandb.log({'Real Pre, Fake Post, Reconstructed Pre)': 
+                wandb.log({'Real Pre, Fake Post, Reconstructed Pre': 
                     wandb.Image(fig_post)})
                 wandb.log({'Real Post, Fake Pre, Reconstructed Post': 
                     wandb.Image(fig_pre)})

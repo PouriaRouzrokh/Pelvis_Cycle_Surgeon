@@ -200,13 +200,13 @@ def plot_images(real: torch.Tensor,
     fig, axes = plt.subplots(nrows=3, ncols=3, figsize=(20, 20))
     opposite_label = 'post' if label == 'pre' else 'pre'
     for i in range(3):
-        axes[i, 0].imshow(real[i])
+        axes[i, 0].imshow(real[i], cmap='bone')
         axes[i, 0].set_title(f'real_{label}')
         axes[i, 0].axis('off')
-        axes[i, 1].imshow(fake[i])
+        axes[i, 1].imshow(fake[i], cmap='bone')
         axes[i, 1].set_title(f'fake_{opposite_label}')
         axes[i, 1].axis('off')
-        axes[i, 2].imshow(consistency[i])
+        axes[i, 2].imshow(consistency[i], cmap='bone')
         axes[i, 2].set_title(f'reconstructed_{label}')
         axes[i, 2].axis('off')
         

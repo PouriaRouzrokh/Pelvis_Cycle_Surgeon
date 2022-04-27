@@ -70,7 +70,7 @@ class DiscConvBLock(nn.Module):
 
 class Discriminator(nn.Module):
     """Discriminator model for the original Cycle GAN."""
-    def __init__(self, in_channels: int = 3, 
+    def __init__(self, in_channels: int = 1, 
                  features: list = [64, 128, 256, 512]):
         """Class constructor.
 
@@ -195,12 +195,12 @@ class GenResBLock(nn.Module):
 
 class Generator(nn.Module):
     """Generator model for the original Cycle GAN."""
-    def __init__(self, img_channels: int = 3, num_features: int = 64,
+    def __init__(self, img_channels: int = 1, num_features: int = 64,
                  num_residuals: int = 9):
         """Class constructor.
 
         Args:
-            img_channels (int, optional): _description_. Defaults to 3.
+            img_channels (int, optional): _description_. Defaults to 1.
             num_residuals (int, optional): _description_. Defaults to 9.
         """
         super().__init__()

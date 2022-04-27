@@ -128,7 +128,6 @@ class PCSDataSet(torch.utils.data.Dataset):
             mn.transforms.RandFlipD(keys="image", prob=0.5, spatial_axis=1),
             mn.transforms.ScaleIntensityD(keys="image"),
             mn.transforms.ToTensorD(keys=["image"]),
-            mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])
         
         # Build MONAI transforms without augmentatiin.
@@ -143,7 +142,6 @@ class PCSDataSet(torch.utils.data.Dataset):
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
             mn.transforms.ScaleIntensityD(keys="image"),
             mn.transforms.ToTensorD(keys=["image"]),
-            mn.transforms.RepeatChannelD(keys="image", repeats=3),
             ])
         
         # Choose the appropriate transforms.
