@@ -3,14 +3,17 @@
 #-------------------------------------------------------------------------------
 
 # Standard built-in modules
+import io
 import os
 import random
 import shutil
 import warnings
 
 # Third-party modules
+import matplotlib.pyplot as plt
 import monai as mn
 import numpy as np
+import PIL
 import torch
 from tqdm import tqdm
 
@@ -137,12 +140,11 @@ def save_checkpoint(state: dict,
     epoch = state['epoch']
     step = state['step'] 
     checkpoint_path = os.path.join(checkpoint_dir, 
-                        f"checkpoint_epoch{epoch}_step{step}_{add_text}.pt")
+                        f"checkpoint_epoch={epoch}_step{step}_{add_text}.pt")
     torch.save(state, checkpoint_path)
     if is_best:
         shutil.copyfile(checkpoint_path, os.path.join(checkpoint_dir, 
                                                 f"best_checkpoint.pt"))
-        
 #-----------------------------------
 # - F: load_weights
     
@@ -165,3 +167,51 @@ def load_weights(model: torch.nn.Module,
     model_dict.update(weights) 
     model.load_state_dict(model_dict)
     return model
+
+#-----------------------------------
+# - F: plot_images
+
+def plot_images(real: torch.Tensor, 
+                     fake: torch.Tensor,
+                     consistency: torch.Tensor,
+                     label: str):
+    """A function to generate a log figure of fake images during the training.
+
+    Args:
+        real (torch.Tensor): a tensor of real images.
+        fake (torch.Tensor): a tensor of fake images.
+        consistency (torch.Tensor): a tensor of fake images which should be 
+            identicial to real images.
+        label (str): a label to be added to the figure. either 'pre' or 'post'.
+
+    Returns:
+        figure (PIL.PngImagePlugin.PngImageFile): The generated figure.
+    """
+    real = real[:3].permute(0, 2, 3, 1).detach().cpu().numpy()
+    real = real - real.min()
+    real = real / (real.max() + 1e-6)
+    fake = fake[:3].permute(0, 2, 3, 1).detach().cpu().numpy()
+    fake = fake - fake.min()
+    fake = fake / (fake.max() + 1e-6)
+    consistency = consistency[:3].permute(0, 2, 3, 1).detach().cpu().numpy()
+    consistency = consistency - consistency.min()
+    consistency = consistency / (consistency.max() + 1e-6)
+    
+    fig, axes = plt.subplots(nrows=3, ncols=3, figsize=(20, 20))
+    opposite_label = 'post' if label == 'pre' else 'pre'
+    for i in range(3):
+        axes[i, 0].imshow(real[i])
+        axes[i, 0].set_title(f'real_{label}')
+        axes[i, 0].axis('off')
+        axes[i, 1].imshow(fake[i])
+        axes[i, 1].set_title(f'fake_{opposite_label}')
+        axes[i, 1].axis('off')
+        axes[i, 2].imshow(consistency[i])
+        axes[i, 2].set_title(f'reconstructed_{label}')
+        axes[i, 2].axis('off')
+        
+    img_buf = io.BytesIO()
+    fig.savefig(img_buf, format='png',  bbox_inches="tight")
+    fig = PIL.Image.open(img_buf)
+    
+    return fig

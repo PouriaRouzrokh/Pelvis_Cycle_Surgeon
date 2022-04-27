@@ -39,11 +39,13 @@ class PCSDataSet(torch.utils.data.Dataset):
     def __init__(self, 
                  data_index_path: str = \
                      f'{root_path}{sep}data{sep}data_index.csv',
-                 image_size: int = 224,
+                 image_size: int = 256,
                  valid_fold: int = 0,
                  train_size: int = -1,
                  valid_size: int = -1,
-                 mode: str = 'train'):
+                 mode: str = 'train',
+                 cache_dir_tag: str = '',
+                 remove_cache: bool = True):
         """Class constructor.
 
         Args:
@@ -60,6 +62,10 @@ class PCSDataSet(torch.utils.data.Dataset):
                 building the dataset. Defalults to -1, which means to use all.
             mode (str, optional): Whether to build the training, validation, or
                 test datasets. Defaults to 'train'.
+            remove_cache (bool, optional): Whether to remove the cache of the
+                PersistentDataset. Defaults to True.
+            cache_dir_tag (str, optional): A string to be used in the beginning
+                of the name of the cache directories. Defaults to ''.
 
         Raises:
             ValueError: If mode is not 'train', 'valid', or 'test'.
@@ -92,9 +98,8 @@ class PCSDataSet(torch.utils.data.Dataset):
                 raise ValueError('The "valid_size" should be at least 100!')
         
         # Building separate dataframes for pre-op and post-op images.
-        pre_df = df[df['STATE'] == 'PRE'][:int(size/2)]
-        post_df = df[df['STATE'] == 'POST'][:int(size/2)]
-        print(size, len(pre_df), len(post_df))
+        pre_df = df[df['STATE'] == 'PRE'][:int(size)]
+        post_df = df[df['STATE'] == 'POST'][:int(size)]
 
         # Build MONAI transforms with augmentations.
         
@@ -111,10 +116,10 @@ class PCSDataSet(torch.utils.data.Dataset):
         
         Aug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
-            mn.transforms.NormalizeIntensityD(keys=["image"]),
+            # mn.transforms.NormalizeIntensityD(keys=["image"]),
             mn.transforms.ScaleIntensityD(keys="image"),
             monai_utils.PadtoSquareD(keys="image"),
-            monai_utils.CLAHED(keys="image"),
+            # monai_utils.CLAHED(keys="image"),
             mn.transforms.ResizeD(keys="image", 
                         spatial_size=(image_size, image_size)),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
@@ -129,10 +134,10 @@ class PCSDataSet(torch.utils.data.Dataset):
         # Build MONAI transforms without augmentatiin.
         NoAug_Ts = mn.transforms.Compose([
             monai_utils.LoadCropD(keys=["image", "crop_key"], dilation=50),
-            mn.transforms.NormalizeIntensityD(keys=["image"]),
+            # mn.transforms.NormalizeIntensityD(keys=["image"]),
             mn.transforms.ScaleIntensityD(keys="image"),
             monai_utils.PadtoSquareD(keys="image"),
-            monai_utils.CLAHED(keys="image"),
+            # monai_utils.CLAHED(keys="image"),
             mn.transforms.ResizeD(keys="image", 
                         spatial_size=(image_size, image_size)),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
@@ -163,11 +168,14 @@ class PCSDataSet(torch.utils.data.Dataset):
         
         # Preparing the cache dirs.
         pre_cache_dir = f'{sep}scratch{sep}projects{sep}'\
-                        f'm221279_Pouria{sep}PCS{sep}{mode}_pre_cache'
+                        f'm221279_Pouria{sep}PCS{sep}'\
+                        f'{cache_dir_tag}_{mode}_pre_cache'
         post_cache_dir = f'{sep}scratch{sep}projects{sep}'\
-                         f'm221279_Pouria{sep}PCS{sep}{mode}_post_cache'
-        shutil.rmtree(pre_cache_dir, ignore_errors=True)
-        shutil.rmtree(post_cache_dir, ignore_errors=True)
+                         f'm221279_Pouria{sep}PCS{sep}'\
+                         f'{cache_dir_tag}_{mode}_post_cache'
+        if remove_cache:
+            shutil.rmtree(pre_cache_dir, ignore_errors=True)
+            shutil.rmtree(post_cache_dir, ignore_errors=True)
         os.makedirs(pre_cache_dir, exist_ok=True)
         os.makedirs(post_cache_dir, exist_ok=True)
 

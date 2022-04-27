@@ -16,13 +16,12 @@ import warnings
 
 # Third-party modules
 import torch
-import torchmetrics
 from tqdm import tqdm
 import wandb
 
 # Local modules
 import datasets
-import models
+import models.cycle_gan as cycle_gan
 import schedulers
 from utils import ddp_utils
 from utils import pytorch_utils
@@ -33,7 +32,7 @@ from utils import pytorch_utils
 
 warnings.filterwarnings("ignore")
 root_path = os.path.dirname(os.path.dirname(__file__))
-os.environ['WANDB_API_KEY'] = '...'
+os.environ['WANDB_API_KEY'] = '91b10c7844cbd7a4b5dfbb4f1a34ce0fb8771fde'
 os.environ["WANDB_SILENT"] = "true"
 
 #-------------------------------------------------------------------------------
@@ -46,14 +45,14 @@ parser_arguments = {
     # - G: Naming conventions
     
     'project_name': {
-        'default': 'PyTorch-DDP-Demo', 
+        'default': 'Pelvis_Cycle_Surgeon', 
         'type': str, 
         'help': 'Name of the project.',
         'action': 'store'
     },
     
     'exp_name': {
-        'default': 'Exp-1', 
+        'default': 'Setup', 
         'type': str, 
         'help': 'Name of the experiment.',
         'action': 'store'
@@ -68,12 +67,6 @@ parser_arguments = {
     
     #---------------------------------------
     # - G: Model hyperparameters
-    
-    'pretrained': {
-        'default':True, 
-        'help': 'Use a pre-trained model.',
-        'action': 'store_true'
-    },
     
     'checkpoint_dir': {
         'default': None, 
@@ -93,7 +86,7 @@ parser_arguments = {
     # - G: Training hyperparameters
 
     'epochs': {
-        'default': 2, 
+        'default': 1, 
         'type': int, 
         'help': 'Number of total epochs to run.',
         'action': 'store'
@@ -107,24 +100,29 @@ parser_arguments = {
     },
     
     'batch_size': {
-        'default': 64, 
+        'default': 128, 
         'type': int, 
         'help': 'Mini-batch size.',
         'action': 'store'
     },
 
     'lr': {
-        'default': 0.01, 
+        'default': 2e-4, 
         'type': float, 
         'help': 'Initial learning rate.',
         'action': 'store'
     },
     
-    'momentum': {
-        'default': 0.9, 
-        'type': float, 
-        'help': 'Momentum value.',
-        'action': 'store'
+    'lambda_cycle': {'default': 10.0, 
+                     'type': float, 
+                     'help': 'Cycle loss weight.', 
+                     'action': 'store'
+    },
+    
+    'lambda_identity': {'default': 1.0,
+                        'type': float, 
+                        'help': 'Identity loss weight.', 
+                        'action': 'store'
     },
     
     'weight_decay': {
@@ -135,29 +133,17 @@ parser_arguments = {
     },
     
     'early_stop_patience': {
-        'default': 3, 
+        'default': 50, 
         'type': int, 
         'help': 'Number of epochs to wait before early stopping.',
         'action': 'store'
     },
     
     'log_freq': {
-        'default': 2, 
+        'default': 10, 
         'type': int, 
         'help': 'Log frequency in steps. Pass -1 to log every epoch.',
         'action': 'store'
-    },
-    
-    'oversample_train': {
-        'default': True, 
-        'help': 'Oversample the training set.',
-        'action': 'store_true'
-    },
-    
-    'oversample_valid': {
-        'default': False, 
-        'help': 'Oversample the validation set.',
-        'action': 'store_true'
     },
     
     'seed': {
@@ -338,9 +324,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
     global is_base_rank 
     global is_ddp
     global train_step_logs
-    global valid_step_logs
     global train_epoch_logs
-    global valid_epoch_logs
     global checkpoint_dir
     global best_benchmark
     global early_stop_counter
@@ -348,24 +332,25 @@ def main_worker(gpu: int, args: argparse.Namespace):
     is_base_rank = bool()
     is_ddp = bool()
     train_step_logs = dict()
-    valid_step_logs = dict()
     train_epoch_logs = dict()
-    valid_epoch_logs = dict()
     best_benchmark = float()
     checkpoint_dir = str()
       
     # The best benchmark will keep the value of a benchmark to save the model
-    # weights during the training. This will be defined in the validation step.
+    # weights during the training. This will be defined in the training steps.
     best_benchmark = None
     early_stop_counter = 0
     
     #---------------------------------------
     #-- Model loading
     
-    model = models.build_model('resnet18', pretrained=args.pretrained, 
-                             random_seed=args.seed)
+    disc_pre = cycle_gan.Discriminator()
+    disc_post = cycle_gan.Discriminator()
+    gen_pre = cycle_gan.Generator()
+    gen_post = cycle_gan.Generator()
     if args.parallel_mode=='ddp' and args.sync_batchnorm:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        for model in [disc_pre, disc_post, gen_pre, gen_post]:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     
     #---------------------------------------
     #-- Data parallel configurations
@@ -378,9 +363,10 @@ def main_worker(gpu: int, args: argparse.Namespace):
         args.workers = int((args.workers + 
                             args.ngpus_per_node-1) / args.ngpus_per_node)
         torch.cuda.set_device(args.gpu)
-        model.cuda(args.gpu)
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu])
+        for model in [disc_pre, disc_post, gen_pre, gen_post]:
+            model.cuda(args.gpu)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[args.gpu])
         is_base_rank = args.gpu == 0
         is_ddp = True
         store = torch.distributed.TCPStore(host_name = args.master_addr, 
@@ -394,8 +380,9 @@ def main_worker(gpu: int, args: argparse.Namespace):
     # Data Parallel; PyTorch will automatically divide and allocate batch_size 
     # to all available GPUs.
     elif args.parallel_mode=='dp':  
-        model.cuda()
-        model = torch.nn.DataParallel(model)
+        for model in [disc_pre, disc_post, gen_pre, gen_post]:
+            model.cuda()
+            model = torch.nn.DataParallel(model)
         is_base_rank = True
         is_ddp = False
         
@@ -403,7 +390,8 @@ def main_worker(gpu: int, args: argparse.Namespace):
     elif args.parallel_mode==None:
         torch.cuda.set_device(args.gpu)
         args.parallel_mode= None
-        model = model.cuda(args.gpu)
+        for model in [disc_pre, disc_post, gen_pre, gen_post]:
+            model = model.cuda(args.gpu)
         is_base_rank = True
         is_ddp = False
     
@@ -416,7 +404,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
         print('-'*80)
         print('Starting the training with: ')
         if args.parallel_mode in ['dp', 'ddp']:
-            print(f'Number of nodes: {args.n_nodes}).')
+            print(f'Number of nodes: {args.n_nodes}')
             print(f'Number of GPUs per node: {args.ngpus_per_node}')
         else:
             print(f'GPU: {args.gpu}')
@@ -429,6 +417,8 @@ def main_worker(gpu: int, args: argparse.Namespace):
         if args.checkpoint_dir is None:
             checkpoint_dir = os.path.join(f'{root_path}{os.path.sep}weights', 
                                         args.exp_name, args.run_name) 
+        else:
+            checkpoint_dir = args.checkpoint_dir
         if os.path.exists(checkpoint_dir):
             shutil.rmtree(checkpoint_dir)
         os.makedirs(checkpoint_dir)
@@ -445,11 +435,19 @@ def main_worker(gpu: int, args: argparse.Namespace):
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = f'cuda:{args.gpu}'
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(f'{args.resume}_{model}', 
+                                        map_location=loc)
             args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            # optimizer.load_state_dict(checkpoint['optimizer'])
-            # scheduler.load_state_dict(checkpoint['scheduler'])
+            gen_pre.load_state_dict(checkpoint['gen_pre']),
+            gen_post.load_state_dict(checkpoint['gen_post']),
+            disc_pre.load_state_dict(checkpoint['disc_pre']),
+            disc_post.load_state_dict(checkpoint['disc_post']),
+            opt_disc.load_state_dict(checkpoint['opt_disc']),
+            opt_gen.load_state_dict(checkpoint['opt_gen'])
+            for param_group in opt_disc.param_groups:
+                param_group["lr"] = args.lr
+            for param_group in opt_gen.param_groups:
+                param_group["lr"] = args.lr
             if is_base_rank:
                 print(f"=> loaded checkpoint '{args.resume}' "
                     f"(epoch {checkpoint['epoch']})")
@@ -459,65 +457,51 @@ def main_worker(gpu: int, args: argparse.Namespace):
     
     #---------------------------------------
     #-- Datasets & data loaders
-    # The minority classes in training and validation sets will be oversampled 
-    # if specified in the arguments.
     # In dataloaders, shuffle should be set to False in case of DDP.
     
-    train_dataset, valid_dataset = datasets.build_datasets()
-    
-    if args.oversample_train:
-        train_sampler = datasets.get_oversampling_sampler(train_dataset)
-    else:
-        train_sampler = None
-    if args.oversample_valid:
-        valid_sampler = datasets.get_oversampling_sampler(valid_dataset)
-    else:
-        valid_sampler = None
-    
+    train_dataset = datasets.PCSDataSet(mode='train', 
+                                        # train_size=5000,
+                                        cache_dir_tag = 'sample_run',
+                                        remove_cache=True)
+        
     if is_ddp: 
-        if args.oversample_train:
-            train_sampler = ddp_utils.DistributedProxySampler(train_sampler)
-        else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dataset)
-        if args.oversample_valid:
-            valid_sampler = ddp_utils.DistributedProxySampler(valid_sampler)
-        else:
-            valid_sampler = torch.utils.data.distributed.DistributedSampler(
-                valid_dataset)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size,
         shuffle=(train_sampler is None), 
         num_workers=args.workers,
-        pin_memory=True, sampler = train_sampler,
-        drop_last=True
-        )
-    valid_loader = torch.utils.data.DataLoader(
-        valid_dataset, batch_size=args.batch_size,
-        shuffle=(valid_sampler is None), 
-        num_workers=args.workers,
-        pin_memory=True, sampler = valid_sampler,
-        drop_last=True
-        )
+        pin_memory=True,
+        sampler = train_sampler,
+        drop_last=True)
+
     if is_base_rank:
         print('The dataloaders are built.')
-    
+
     #---------------------------------------
-    #-- Loss
-    
-    criterion = torch.nn.CrossEntropyLoss()
-    if args.gpu is None:
-        criterion.cuda()
-    else:
-        criterion.cuda(args.gpu) 
+    #-- Loss functions
+    Loss_fn1 = torch.nn.L1Loss()
+    loss_fn2 = torch.nn.MSELoss()
+    loss_fns = [Loss_fn1, loss_fn2]
+    for loss_fn in loss_fns:
+        if args.gpu is None:
+            loss_fn.cuda()
+        else:
+            loss_fn.cuda(args.gpu) 
     
     #---------------------------------------
     #-- Optimizer & scheduler
     
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    opt_disc = torch.optim.Adam(
+        list(disc_pre.parameters()) + list(disc_post.parameters()), 
+        args.lr,
+        weight_decay=args.weight_decay)
+    
+    opt_gen = torch.optim.Adam(
+        list(gen_pre.parameters()) + list(gen_post.parameters()), 
+        args.lr,
+        weight_decay=args.weight_decay)
     
     # Define the learning rate scheduler using CosineAnnealingWarmupRestarts.
     # Alternatively, use torch.optim.lr_scheduler schedulers.
@@ -550,8 +534,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
         )
         
         # Define which metrics should be plotted against "epochs" as the X axis.
-        epoch_metrics = ['train_epoch_loss', 'valid_epoch_loss', 
-                         'train_epoch_acc', 'valid_epoch_acc']
+        epoch_metrics = ['train_epoch_loss']
         wandb.define_metric("epochs")
         for metric in epoch_metrics:
             wandb.define_metric(metric, step_metric="epochs")
@@ -572,25 +555,16 @@ def main_worker(gpu: int, args: argparse.Namespace):
     # Start the epoch loop.
     ddp_utils.barrier(is_ddp)
     for i, epoch in enumerate(range(args.start_epoch, args.epochs)):
-        if is_ddp:
-            train_sampler.set_epoch(epoch)
         if is_base_rank:
             print('-'*50, f'Starting epoch: {epoch}')
         
         # Train for one epoch.
         ddp_utils.barrier(is_ddp)
-        train_outputs = train_one_epoch(train_loader, model, criterion, 
-                                        optimizer, scheduler, epoch, args)
+        train_outputs = train_one_epoch(train_loader, disc_pre, disc_post, 
+                                        gen_pre, gen_post, loss_fns, opt_disc, 
+                                        opt_gen, scheduler, epoch, args)
         
         # Do something with the train_outputs if needed.
-        # ...
-
-        # Validate for one epoch.
-        ddp_utils.barrier(is_ddp)
-        valid_outputs = validate_one_epoch(valid_loader, model, 
-                                           criterion, epoch, args)
-        
-        # Do something with the valid_outputs if needed.
         # ...
         
         # Check for early stopping.
@@ -624,16 +598,20 @@ def main_worker(gpu: int, args: argparse.Namespace):
         torch.cuda.empty_cache()
 
 #-------------------------------------------------------------------------------
-# Training and validation loops
+# Training loop
 #-------------------------------------------------------------------------------
 
 #---------------------------------------
 # - F: train_one_epch
 
 def train_one_epoch(train_loader: Iterable, 
-                    model: torch.nn.Module, 
-                    criterion: Callable, 
-                    optimizer: torch.optim.Optimizer, 
+                    disc_pre: torch.nn.Module, 
+                    disc_post: torch.nn.Module, 
+                    gen_pre: torch.nn.Module, 
+                    gen_post: torch.nn.Module, 
+                    loss_fns : list[Callable],
+                    opt_disc: torch.optim.Optimizer, 
+                    opt_gen: torch.optim.Optimizer,
                     scheduler: torch.optim.lr_scheduler,
                     epoch: int, 
                     args: argparse.Namespace) -> dict:
@@ -641,9 +619,19 @@ def train_one_epoch(train_loader: Iterable,
     
     Args:
         train_loader (Iterable): Dataloader for training.
-        model (torch.nn.Module): PyTorch model to be trained.
-        criterion (Callable): loss function to be used for training
-        optimizer (torch.optim.Optimizer): optimizer to be used for training.
+        disc_pre (torch.nn.Module):PyTorch discriminator model
+            for generating the pre-operative images.
+        disc_post (torch.nn.Module):PyTorch discriminator model
+            for generating the post-operative images.
+        gen_pre (torch.nn.Module):PyTorch generator model
+            for generating the pre-operative images.
+        gen_post (torch.nn.Module):PyTorch generator model
+            for generating the post-operative images.
+        loss_fns (list[Callable]): List of loss functions.
+        opt_disc (torch.optim.Optimizer): optimizer to be used 
+            for the discriminators.
+        opt_gen (torch.optim.Optimizer): optimizer to be used 
+            for the generators.
         scheduler (torch.optim.lr_scheduler): scheduler to be used for training.
         epoch (int): the current epoch.
         args (argparse.Namespace): parsed arguments.
@@ -657,7 +645,8 @@ def train_one_epoch(train_loader: Iterable,
             loop.
     """
     # Mention global variables that may be reassigned in this function.
-    #...
+    global best_benchmark
+    global early_stop_counter
     
     # Define the train_ouputs dictionary. This can be useful if you need to 
     # return anything from this function to the epoch loop. Do not use this 
@@ -665,8 +654,10 @@ def train_one_epoch(train_loader: Iterable,
     # dictionaries. Also, do not return global variables.
     train_outputs = dict()
     
-    # Set up the validation loop.
-    model.train()
+    # Set up the training loop.
+    for model in [disc_pre, disc_post, gen_pre, gen_post]:
+        model.train()
+    loss_fn1, loss_fn2 = loss_fns
     if is_base_rank:
         pbar = tqdm(total=len(train_loader), desc=f'Training', unit='batch')
     if args.log_freq == -1:
@@ -679,198 +670,175 @@ def train_one_epoch(train_loader: Iterable,
     # Start the training loop.
     for i, batch in enumerate(train_loader):
         if args.gpu is None:
-            inputs = batch['image'].cuda()
-            labels = batch['label'].cuda()
+            real_pre = batch['pre'].cuda()
+            real_post = batch['post'].cuda()
         else:
-            inputs = batch['image'].cuda(args.gpu)
-            labels = batch['label'].cuda(args.gpu)
+            real_pre = batch['pre'].cuda(args.gpu)
+            real_post = batch['post'].cuda(args.gpu)
+                    
+        ############################### Train the discriminators.
         
-        # Forward pass + calculate the loss.
-        optimizer.zero_grad()
-        preds = model(inputs)
-        train_loss = criterion(preds, labels)
-    
-        # Backward pass + optimization
-        train_loss.backward()
-        optimizer.step()
+        # Discriminator for the post-op images.
+        fake_post = gen_post(real_pre)
+        D_post_real = disc_post(real_post)
+        D_post_fake = disc_post(fake_post.detach())
+        D_post_real_loss = loss_fn2(D_post_real, 
+                                            torch.ones_like(D_post_real))
+        D_post_fake_loss = loss_fn2(D_post_fake,
+                                            torch.zeros_like(D_post_fake))
+        D_post_loss = D_post_real_loss + D_post_fake_loss
+                
+        # Discriminator for the pre-op images.
+        fake_pre = gen_pre(real_post)
+        D_pre_real = disc_pre(real_pre)
+        D_pre_fake = disc_pre(fake_pre.detach())
+        D_pre_real_loss = loss_fn2(D_pre_real, torch.ones_like(D_pre_real))
+        D_pre_fake_loss = loss_fn2(D_pre_fake, torch.zeros_like(D_pre_fake))
+        D_pre_loss = D_pre_real_loss + D_pre_fake_loss
+        
+        # The total discriminator loss.
+        train_D_loss = (D_pre_loss + D_post_loss) / 2
+        
+        # Optimize the discriminators.
+        opt_disc.zero_grad()
+        train_D_loss.backward()
+        opt_disc.step()
         
         # Adjust the learning rate in each step, if needed.
         # scheduler.step(epoch + i/len(train_loader))
         
+        ############################### Train the generators.
+        
+        # Adversarial loss for both generators.
+        D_pre_fake = disc_pre(fake_pre)
+        D_post_fake = disc_post(fake_post)
+        G_pre_loss = loss_fn2(D_pre_fake, torch.ones_like(D_pre_fake))
+        G_post_loss = loss_fn2(D_post_fake, torch.ones_like(D_post_fake))  
+        
+        # Cycle Consistency loss for both generators.
+        cycle_pre = gen_pre(fake_post)
+        cycle_post = gen_post(fake_pre)      
+        cycle_pre_loss = loss_fn1(cycle_pre, real_pre)
+        cycle_post_loss = loss_fn1(cycle_post, real_post)
+        
+        # Identity loss for both generators.
+        identity_pre = gen_pre(real_pre)
+        identity_post = gen_post(real_post)
+        idendity_pre_loss = loss_fn1(identity_pre, real_pre)
+        identity_post_loss = loss_fn1(identity_post, real_post)
+        
+        # Adding all the generator losses.
+        train_G_loss = (G_pre_loss + 
+                        G_post_loss +
+                        cycle_pre_loss * args.lambda_cycle +
+                        cycle_post_loss * args.lambda_cycle +
+                        idendity_pre_loss * args.lambda_identity +
+                        identity_post_loss * args.lambda_identity)
+        
+        # Optimize the generators.
+        opt_gen.zero_grad()
+        train_G_loss.backward()
+        opt_gen.step()
+        
+        # Adjust the learning rate in each step, if needed.
+        # scheduler.step(epoch + i/len(train_loader))
+        
+        ###############################
+        
         # Calculate the training metrics.
-        train_acc = torchmetrics.functional.accuracy(preds.softmax(dim=-1), 
-                                                     labels)
+        # ...
         
         # Update the train_outputs dictionary, if needed.
         # ...
-        
+                
         # Log the step-wise stats.
         if i>0 and (i+1) % train_log_freq == 0:
-            collect_log(train_loss, 'train_loss', 's')   
-            collect_log(train_acc, 'train_acc', 's')
+            collect_log(train_G_loss, 'train_G_loss', 's')   
+            collect_log(train_D_loss, 'train_D_loss', 's')
             if is_base_rank:
-                wandb.log({'train_step_loss': train_loss.item(),
-                           'train_step_acc': train_acc.item(),
+                wandb.log({'train_step_G_loss': train_G_loss.item(),
+                           'train_step_D_loss': train_D_loss.item(),
                            'step': epoch*len(train_loader) + i})
+                fig_post = pytorch_utils.plot_images(real_pre, fake_post, 
+                                                    identity_pre, label='pre')
+                fig_pre = pytorch_utils.plot_images(real_post, fake_pre, 
+                                                    identity_post, label='post')
+                wandb.log({'Real Pre, Fake Post, Reconstructed Pre)': 
+                    wandb.Image(fig_post)})
+                wandb.log({'Real Post, Fake Pre, Reconstructed Post': 
+                    wandb.Image(fig_pre)})
             
-        # Update the progress bar every step.
         if is_base_rank:
+            # Update the progress bar every step.
             pbar.update(1)
-            pbar.set_postfix_str(f'batch train loss: {train_loss.item():.2f}')
+            pbar.set_postfix_str(f'batch train G & D loss: '
+                                 f'{train_G_loss.item():.2f}'
+                                 f'{train_D_loss.item():.2f}')
+            
+            # Save the best model if the current benchmark is better than the 
+            # already measured best bechmark. Else, increment the 
+            # early_stop_counter.
+            if i>0 and (i+1) % (2*train_log_freq) == 0:
+                if best_benchmark is None: 
+                    best_benchmark = train_G_loss
+                if train_G_loss <= best_benchmark:
+                    best_benchmark = train_G_loss
+                    pytorch_utils.save_checkpoint(
+                        {'epoch': epoch, 
+                         'step':i,
+                         'gen_pre': gen_pre.state_dict(),
+                         'gen_post': gen_post.state_dict(),
+                         'disc_pre': disc_pre.state_dict(),
+                         'disc_post': disc_post.state_dict(),
+                         'opt_disc': opt_disc.state_dict(),
+                         'opt_gen': opt_gen.state_dict()
+                        }, 
+                        checkpoint_dir = checkpoint_dir,
+                        add_text = f'G-loss={best_benchmark:.2f}')
+                    early_stop_counter = 0
+                else:
+                    early_stop_counter += 1
         
     # Do base-rank operations at the end of the training loop.
     if is_base_rank:
 
         # Log the epoch-wise stats.
-        train_epoch_loss = statistics.mean(
-            train_step_logs['train_loss'][-len(train_loader):])
-        train_epoch_acc = statistics.mean(
-            train_step_logs['train_acc'][-len(train_loader):])
-        collect_log(train_epoch_loss, 'train_epoch_loss', 'e')
-        collect_log(train_epoch_acc, 'train_epoch_acc', 'e')
-        wandb.log({'train_epoch_loss': train_epoch_loss,
-                   'train_epoch_acc': train_epoch_acc,
+        train_epoch_G_loss = statistics.mean(
+            train_step_logs['train_G_loss'][-len(train_loader):])
+        train_epoch_D_loss = statistics.mean(
+            train_step_logs['train_D_loss'][-len(train_loader):])
+        collect_log(train_epoch_G_loss, 'train_epoch_G_loss', 'e')
+        collect_log(train_epoch_D_loss, 'train_epoch_D_loss', 'e')
+        wandb.log({'train_epoch_G_loss': train_epoch_G_loss,
+                   'train_epoch_D_loss': train_epoch_D_loss,
                    'epoch': epoch})
     
         # Close the progress bar.
         pbar.close()
-        time.sleep(0.1)
-        print(f"The average train loss for epoch {epoch}: ", 
-              f"{train_epoch_loss:.2f}")
-        print(f"The average train accuracy for epoch {epoch}: ", 
-              f"{train_epoch_acc:.2f}")     
-        print('-'*20)
+        time.sleep(0.2)
+        print(f"The average train G loss for epoch {epoch}: ", 
+              f"{train_epoch_G_loss:.2f}")
+        print(f"The average train D loss for epoch {epoch}: ", 
+              f"{train_epoch_D_loss:.2f}")  
+        print(f'The best train_G_loss achieved by the end of epoch {epoch}: '
+              f'{best_benchmark:.2f}')   
         
+        # Save the model at the end of the epoch.
+        pytorch_utils.save_checkpoint(
+            {'epoch': epoch,
+             'step': 'checkpoint',
+             'gen_pre': gen_pre.state_dict(),
+             'gen_post': gen_post.state_dict(),
+             'disc_pre': disc_pre.state_dict(),
+             'disc_post': disc_post.state_dict(),
+             'opt_disc': opt_disc.state_dict(),
+             'opt_gen': opt_gen.state_dict()}, 
+            checkpoint_dir = checkpoint_dir,
+            add_text = f'G-loss={best_benchmark:.2f}'
+        )      
+    
     return train_outputs
 
-#---------------------------------------
-# - F: validate_one_epch
-
-def validate_one_epoch(valid_loader: Iterable, 
-                       model: torch.nn.Module, 
-                       criterion: Callable, 
-                       epoch: int,
-                       args: argparse.Namespace) -> dict:
-    """Validate the model for one epoch.
-    
-    Args:
-        valid_loader (Iterable): Dataloader for validation.
-        model (torch.nn.Module): PyTorch model to be trained.
-        criterion (Callable): loss function to be used for training.
-        epoch (int): the current epoch.
-        args (argparse.Namespace): parsed arguments.
-        
-    Raises:
-        ValueError: raises an error if the "log_freq" is not a positive 
-            number.
-            
-    Returns:
-        valid_outputs (dict): dictionary containing the outputs of the
-            validation loop.
-    """
-    # Mention global variables that may be reassigned in this function.
-    global best_benchmark
-    global early_stop_counter
-    
-    # Define the valid_outputs dictionary. This can be useful if you need to 
-    # return anythinng from this function to the epoch loop. Do not use this 
-    # dictionary for logging as logging will automatically be done using global 
-    # dictionaries. Also, do not return global variables.
-    valid_outputs = dict()
-    
-    # Set up the validation loop.
-    model.eval()
-    if is_base_rank:
-        pbar = tqdm(total=len(valid_loader), desc=f'Validation', 
-                    unit='batch')  
-    if args.log_freq == -1:
-        valid_log_freq = len(valid_loader)
-    elif args.log_freq > 0:
-        valid_log_freq = min(args.log_freq, len(valid_loader))
-    else:
-        raise ValueError('The log_freq should be positive.')
-        
-    # Start the validation loop.
-    with torch.no_grad():
-        for i, batch in enumerate(valid_loader):
-            if args.gpu is None:
-                inputs = batch['image'].cuda()
-                labels = batch['label'].cuda() 
-            else:
-                inputs = batch['image'].cuda(args.gpu)
-                labels = batch['label'].cuda(args.gpu)
-
-            # Forward pass + calculate the loss
-            preds = model(inputs)
-            valid_loss = criterion(preds, labels)
-            
-            # Calculate the validation metrics.
-            valid_acc = torchmetrics.functional.accuracy(preds.softmax(dim=-1), 
-                                                         labels)
-            
-            # Update the valid_outputs dictionary, if needed.
-            ...
-    
-            # Log the step-wise stats.
-            if  i>0 and (i+1) % valid_log_freq == 0:
-                collect_log(valid_loss, 'valid_loss', 's')
-                collect_log(valid_acc, 'valid_acc', 's')
-                if is_base_rank:
-                    wandb.log({'valid_step_loss': valid_loss.item(),
-                            'valid_step_acc': valid_acc.item(),
-                            'step': epoch*len(valid_loader) + i})
-                
-            # Update the progress bar every step.
-            if is_base_rank:
-                pbar.update(1)
-                pbar.set_postfix_str(f'batch valid loss: '
-                                     f'{valid_loss.item():.2f}')
-        
-    # Do base-rank operations at the end of the validation loop.
-    if is_base_rank:
-        
-        # Log the epochwise stats.
-        valid_epoch_loss = statistics.mean(
-            valid_step_logs['valid_loss'][-len(valid_loader):])
-        valid_epoch_acc = statistics.mean(
-            valid_step_logs['valid_acc'][-len(valid_loader):])
-        collect_log(valid_epoch_loss, 'valid_epoch_loss', 'e')
-        collect_log(valid_epoch_acc, 'valid_epoch_acc', 'e')
-        wandb.log({'valid_epoch_loss': valid_epoch_loss,
-                   'valid_epoch_acc': valid_epoch_acc,
-                   'epoch': epoch})
-    
-        # Close the progress bar.
-        pbar.close() 
-        time.sleep(0.1)
-        print(f"The average valid loss for epoch {epoch}: ", 
-              f"{valid_epoch_loss:.2f}")   
-        print(f"The average valid accuracy for epoch {epoch}: ", 
-              f"{valid_epoch_acc:.2f}")
-        
-        # Save the best model if the current benchmark is better than the 
-        # already measured best bechmark. Else, increment the early_stop_counter.
-        if best_benchmark is None: 
-            best_benchmark = valid_epoch_loss
-        if valid_epoch_loss <= best_benchmark:
-            best_benchmark = valid_epoch_loss
-            if args.parallel_mode in ['dp', 'ddp']:
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            pytorch_utils.save_checkpoint(
-                {'state_dict': state_dict,'epoch': epoch, 'step':i}, 
-                checkpoint_dir = checkpoint_dir,
-                add_text = f'val-loss={best_benchmark:.2f}')
-            early_stop_counter = 0
-            print('-'*20)
-            print(f'A new best model is saved at epoch {epoch}.')
-            print(f'The best new valid_epoch_loss is: {best_benchmark:.2f}')
-        else:
-            early_stop_counter += 1
-            
-    return valid_outputs
-    
 #-------------------------------------------------------------------------------
 # Helper functions
 # These functions work with the global variables in this script, and hence, 
@@ -909,14 +877,14 @@ def collect_log(log_key: Union[torch.tensor, float],
         if 'train' in log_key_name:
             logs = train_step_logs
         elif 'valid' in log_key_name:
-            logs = valid_step_logs
+            raise ValueError('No validation set is defined for this training!')
         else:
             raise ValueError('Unknown log_key_name!')
     else:
         if 'train' in log_key_name:
             logs = train_epoch_logs
         elif 'valid' in log_key_name:
-            logs = valid_epoch_logs
+            raise ValueError('No validation set is defined for this training!')
         else:
             raise ValueError('Unknown log_key_name!')
     
