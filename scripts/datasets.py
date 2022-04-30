@@ -123,7 +123,7 @@ class PCSDataSet(torch.utils.data.Dataset):
             mn.transforms.ResizeD(keys="image", 
                         spatial_size=(image_size, image_size)),
             monai_utils.TransposeD(keys="image", indices=[0, 2, 1]),
-            monai_utils.RandAugD(keys="image"),
+            # monai_utils.RandAugD(keys="image"),
             mn.transforms.RandZoomD(keys="image", mode="bilinear"),
             mn.transforms.RandFlipD(keys="image", prob=0.5, spatial_axis=1),
             mn.transforms.ScaleIntensityD(keys="image"),

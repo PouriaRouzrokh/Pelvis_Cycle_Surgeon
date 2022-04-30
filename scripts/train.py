@@ -15,13 +15,15 @@ from typing import Callable, Iterable, Union
 import warnings
 
 # Third-party modules
+import segmentation_models_pytorch as smp
 import torch
 from tqdm import tqdm
 import wandb
 
 # Local modules
 import datasets
-import models.cycle_gan as cycle_gan
+from models import cycle_gan
+from models import custom_discriminators
 import schedulers
 from utils import ddp_utils
 from utils import pytorch_utils
@@ -52,7 +54,7 @@ parser_arguments = {
     },
     
     'exp_name': {
-        'default': 'Setup', 
+        'default': 'lr_search', 
         'type': str, 
         'help': 'Name of the experiment.',
         'action': 'store'
@@ -62,6 +64,14 @@ parser_arguments = {
         'default': None, 
         'type': str, 
         'help': 'Name of the training run (default: the current datetime).',
+        'action': 'store'
+    },
+    
+    'run_notes': {
+        'default': 'Added LR scheduler: CosineAnnealingWarmupRestarts.'
+                   'Generator: EfficientNet-B0, Discriminator: CycleGAN.', 
+        'type': str, 
+        'help': 'What that was tried in this run.',
         'action': 'store'
     },
     
@@ -86,7 +96,7 @@ parser_arguments = {
     # - G: Training hyperparameters
 
     'epochs': {
-        'default': 1, 
+        'default': 200, 
         'type': int, 
         'help': 'Number of total epochs to run.',
         'action': 'store'
@@ -113,27 +123,33 @@ parser_arguments = {
         'action': 'store'
     },
     
-    'lambda_cycle': {'default': 10.0, 
+    'lambda_cycle': {'default': 1.0, 
                      'type': float, 
                      'help': 'Cycle loss weight.', 
                      'action': 'store'
     },
     
-    'lambda_identity': {'default': 1.0,
+    'lambda_identity': {'default': 0.0,
                         'type': float, 
                         'help': 'Identity loss weight.', 
                         'action': 'store'
     },
     
     'weight_decay': {
-        'default': 1e-4, 
+        'default': 0.0, 
         'type': float, 
         'help': 'Weight decay value.',
         'action': 'store'
     },
     
+    'use_scheduler': {
+        'default': True, 
+        'help': 'To use a learning rate scheduler.',
+        'action': 'store_true'
+    },
+    
     'early_stop_patience': {
-        'default': 50, 
+        'default': 1000, 
         'type': int, 
         'help': 'Number of epochs to wait before early stopping.',
         'action': 'store'
@@ -346,8 +362,18 @@ def main_worker(gpu: int, args: argparse.Namespace):
     
     disc_pre = cycle_gan.Discriminator()
     disc_post = cycle_gan.Discriminator()
-    gen_pre = cycle_gan.Generator()
-    gen_post = cycle_gan.Generator()
+    # gen_pre = cycle_gan.Generator()
+    # gen_post = cycle_gan.Generator()
+    # disc_pre = custom_discriminators.EffNetDiscriminator()
+    # disc_post = custom_discriminators.EffNetDiscriminator()
+    # disc_pre = custom_discriminators.ResNetDiscriminator()
+    # disc_post = custom_discriminators.ResNetDiscriminator()
+    gen_pre = smp.Unet(encoder_name="efficientnet-b0", 
+                       encoder_weights="imagenet", in_channels=1, 
+                       classes=1, activation="tanh")
+    gen_post = smp.Unet(encoder_name="efficientnet-b0", 
+                        encoder_weights="imagenet", in_channels=1, 
+                        classes=1, activation="tanh")
     if args.parallel_mode=='ddp' and args.sync_batchnorm:
         for model in [disc_pre, disc_post, gen_pre, gen_post]:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -424,45 +450,13 @@ def main_worker(gpu: int, args: argparse.Namespace):
         os.makedirs(checkpoint_dir)
     
     #---------------------------------------
-    #-- Resuming from a checkpoint
-    
-    if args.resume:
-        if os.path.isfile(args.resume):
-            if is_base_rank:
-                print(f"=> loading checkpoint '{args.resume}'")
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = f'cuda:{args.gpu}'
-                checkpoint = torch.load(f'{args.resume}_{model}', 
-                                        map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            gen_pre.load_state_dict(checkpoint['gen_pre']),
-            gen_post.load_state_dict(checkpoint['gen_post']),
-            disc_pre.load_state_dict(checkpoint['disc_pre']),
-            disc_post.load_state_dict(checkpoint['disc_post']),
-            opt_disc.load_state_dict(checkpoint['opt_disc']),
-            opt_gen.load_state_dict(checkpoint['opt_gen'])
-            for param_group in opt_disc.param_groups:
-                param_group["lr"] = args.lr
-            for param_group in opt_gen.param_groups:
-                param_group["lr"] = args.lr
-            if is_base_rank:
-                print(f"=> loaded checkpoint '{args.resume}' "
-                    f"(epoch {checkpoint['epoch']})")
-        else:
-            if is_base_rank:
-                print("=> no checkpoint found at '{}'".format(args.resume))
-    
-    #---------------------------------------
     #-- Datasets & data loaders
     # In dataloaders, shuffle should be set to False in case of DDP.
     
     train_dataset = datasets.PCSDataSet(mode='train', 
-                                        # train_size=5000,
-                                        cache_dir_tag = 'full_run',
-                                        remove_cache=True)
+                                        train_size=5000,
+                                        cache_dir_tag = 'sample_run',
+                                        remove_cache=False)
         
     if is_ddp: 
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -505,32 +499,79 @@ def main_worker(gpu: int, args: argparse.Namespace):
     
     # Define the learning rate scheduler using CosineAnnealingWarmupRestarts.
     # Alternatively, use torch.optim.lr_scheduler schedulers.
-    # If no scheduler is needed, pass it as None.
-    scheduler = None
-    """
-    scheduler = schedulers.CosineAnnealingWarmupRestarts(
-        optimizer,
-        first_cycle_steps=40,
-        cycle_mult=1.0,
-        max_lr=0.01,
-        min_lr=0.001,
-        warmup_steps=10,
-        gamma=0.5
+    
+    # If no scheduler is needed, keep the lr constant during the training.
+    if args.use_scheduler:
+        sched_gen = schedulers.CosineAnnealingWarmupRestarts(
+            optimizer = opt_gen,
+            first_cycle_steps = 10,
+            cycle_mult = 1,
+            max_lr = args.lr,
+            min_lr = 1e-5,
+            warmup_steps = 0,
         )
-    """
+        sched_disc = schedulers.CosineAnnealingWarmupRestarts(
+            optimizer = opt_disc,
+            first_cycle_steps = 10,
+            cycle_mult = 1,
+            max_lr = args.lr,
+            min_lr = 1e-5,
+            warmup_steps = 0,
+        )  
+    else:
+        sched_gen = None
+        sched_disc = None
+    
+    #---------------------------------------
+    #-- Resuming from a checkpoint
+    
+    if args.resume:
+        if os.path.isfile(args.resume):
+            if is_base_rank:
+                print(f"=> loading checkpoint '{args.resume}'")
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = f'cuda:{args.gpu}'
+                checkpoint = torch.load(f'{args.resume}_{model}', 
+                                        map_location=loc)
+            args.start_epoch = checkpoint['epoch']
+            gen_pre.load_state_dict(checkpoint['gen_pre'])
+            gen_post.load_state_dict(checkpoint['gen_post'])
+            disc_pre.load_state_dict(checkpoint['disc_pre'])
+            disc_post.load_state_dict(checkpoint['disc_post'])
+            opt_disc.load_state_dict(checkpoint['opt_disc'])
+            opt_gen.load_state_dict(checkpoint['opt_gen'])
+            if args.use_scheduler:
+                sched_disc.load_state_dict(checkpoint['sched_disc'])
+                sched_gen.load_state_dict(checkpoint['sched_gen'])
+            
+            # Do this if you want to restart the learning rate.
+            for param_group in opt_disc.param_groups:
+                param_group["lr"] = args.lr
+            for param_group in opt_gen.param_groups:
+                param_group["lr"] = args.lr
+            
+            if is_base_rank:
+                print(f"=> loaded checkpoint '{args.resume}' "
+                    f"(epoch {checkpoint['epoch']})")
+        else:
+            if is_base_rank:
+                print("=> no checkpoint found at '{}'".format(args.resume))
     
     #---------------------------------------
     #-- WandB initilization
     
     if is_base_rank:
         wandb.init(
-        project = args.project_name, 
-        group = args.exp_name, 
-        name = args.run_name,
-        notes = None,
-        config = args,
-        mode = 'online',
-        save_code = True,
+            project = args.project_name, 
+            group = args.exp_name, 
+            name = args.run_name,
+            notes = args.run_notes,
+            config = args,
+            mode = 'online',
+            save_code = True,
         )
         
         # Define which metrics should be plotted against "epochs" as the X axis.
@@ -562,7 +603,8 @@ def main_worker(gpu: int, args: argparse.Namespace):
         ddp_utils.barrier(is_ddp)
         train_outputs = train_one_epoch(train_loader, disc_pre, disc_post, 
                                         gen_pre, gen_post, loss_fns, opt_disc, 
-                                        opt_gen, scheduler, epoch, args)
+                                        opt_gen, sched_disc, sched_gen, 
+                                        epoch, args)
         
         # Do something with the train_outputs if needed.
         # ...
@@ -612,7 +654,8 @@ def train_one_epoch(train_loader: Iterable,
                     loss_fns : list[Callable],
                     opt_disc: torch.optim.Optimizer, 
                     opt_gen: torch.optim.Optimizer,
-                    scheduler: torch.optim.lr_scheduler,
+                    sched_disc: torch.optim.lr_scheduler,
+                    sched_gen: torch.optim.lr_scheduler,
                     epoch: int, 
                     args: argparse.Namespace) -> dict:
     """Train the model for one epoch.
@@ -632,7 +675,10 @@ def train_one_epoch(train_loader: Iterable,
             for the discriminators.
         opt_gen (torch.optim.Optimizer): optimizer to be used 
             for the generators.
-        scheduler (torch.optim.lr_scheduler): scheduler to be used for training.
+        sched_disc (torch.optim.lr_scheduler): scheduler to be used for 
+            the discriminator.
+        sched_gen (torch.optim.lr_scheduler): scheduler to be used for 
+            the generator.
         epoch (int): the current epoch.
         args (argparse.Namespace): parsed arguments.
         
@@ -703,6 +749,8 @@ def train_one_epoch(train_loader: Iterable,
         opt_disc.zero_grad()
         train_D_loss.backward()
         opt_disc.step()
+        if args.use_scheduler:
+            sched_disc.step()
         
         # Adjust the learning rate in each step, if needed.
         # scheduler.step(epoch + i/len(train_loader))
@@ -739,6 +787,8 @@ def train_one_epoch(train_loader: Iterable,
         opt_gen.zero_grad()
         train_G_loss.backward()
         opt_gen.step()
+        if args.use_scheduler:
+            sched_gen.step()
         
         # Adjust the learning rate in each step, if needed.
         # scheduler.step(epoch + i/len(train_loader))
@@ -752,13 +802,35 @@ def train_one_epoch(train_loader: Iterable,
         # ...
                 
         # Log the step-wise stats.
+        if args.use_scheduler and is_base_rank:
+            wandb.log({
+                'G_lr': sched_gen.get_lr()[0],
+                'D_lr': sched_disc.get_lr()[0],
+            })
         if i>0 and (i+1) % train_log_freq == 0:
+            collect_log(G_pre_loss, 'G_pre_loss', 's')
+            collect_log(G_post_loss, 'G_post_loss', 's')
+            collect_log(cycle_pre_loss, 'cycle_pre_loss', 's')
+            collect_log(cycle_post_loss, 'cycle_post_loss', 's')
+            collect_log(idendity_pre_loss, 'idendity_pre_loss', 's')
+            collect_log(identity_post_loss, 'identity_post_loss', 's')
+            collect_log(D_pre_loss, 'D_pre_loss', 's')
+            collect_log(D_post_loss, 'D_post_loss', 's')
             collect_log(train_G_loss, 'train_G_loss', 's')   
             collect_log(train_D_loss, 'train_D_loss', 's')
             if is_base_rank:
-                wandb.log({'train_step_G_loss': train_G_loss.item(),
-                           'train_step_D_loss': train_D_loss.item(),
-                           'step': epoch*len(train_loader) + i})
+                wandb.log({
+                    'G_pre_loss': G_pre_loss.item(),
+                    'G_post_loss': G_post_loss.item(),
+                    'cycle_pre_loss': cycle_pre_loss.item(),
+                    'cycle_post_loss': cycle_post_loss.item(),
+                    'idendity_pre_loss': idendity_pre_loss.item(),
+                    'identity_post_loss': identity_post_loss.item(),
+                    'D_pre_loss': D_pre_loss.item(),
+                    'D_post_loss': D_post_loss.item(),
+                    'train_step_G_loss': train_G_loss.item(),
+                    'train_step_D_loss': train_D_loss.item(),
+                    'step': epoch*len(train_loader) + i})
                 fig_post = pytorch_utils.plot_images(real_pre, fake_post, 
                                                     identity_pre, label='pre')
                 fig_pre = pytorch_utils.plot_images(real_post, fake_pre, 
@@ -791,7 +863,11 @@ def train_one_epoch(train_loader: Iterable,
                          'disc_pre': disc_pre.state_dict(),
                          'disc_post': disc_post.state_dict(),
                          'opt_disc': opt_disc.state_dict(),
-                         'opt_gen': opt_gen.state_dict()
+                         'opt_gen': opt_gen.state_dict(),
+                         'sched_gen': sched_gen.state_dict() \
+                             if sched_gen is not None else None,
+                         'sched_disc': sched_gen.state_dict() \
+                             if sched_disc is not None else None,
                         }, 
                         checkpoint_dir = checkpoint_dir,
                         add_text = f'G-loss={best_benchmark:.2f}')
@@ -832,7 +908,11 @@ def train_one_epoch(train_loader: Iterable,
              'disc_pre': disc_pre.state_dict(),
              'disc_post': disc_post.state_dict(),
              'opt_disc': opt_disc.state_dict(),
-             'opt_gen': opt_gen.state_dict()}, 
+             'opt_gen': opt_gen.state_dict(),
+             'sched_gen': sched_gen.state_dict() \
+                 if sched_gen is not None else None,
+             'sched_disc': sched_gen.state_dict() \
+                 if sched_disc is not None else None},
             checkpoint_dir = checkpoint_dir,
             add_text = f'G-loss={best_benchmark:.2f}'
         )      
@@ -874,19 +954,10 @@ def collect_log(log_key: Union[torch.tensor, float],
     assert mode in ['s', 'e'], \
         "The mode should be either 's' (step) or 'e' (epoch)."   
     if mode == 's':
-        if 'train' in log_key_name:
-            logs = train_step_logs
-        elif 'valid' in log_key_name:
-            raise ValueError('No validation set is defined for this training!')
-        else:
-            raise ValueError('Unknown log_key_name!')
+        logs = train_step_logs
     else:
-        if 'train' in log_key_name:
-            logs = train_epoch_logs
-        elif 'valid' in log_key_name:
-            raise ValueError('No validation set is defined for this training!')
-        else:
-            raise ValueError('Unknown log_key_name!')
+        logs = train_epoch_logs
+
     
     # Gathering the log_key. If the log key is a float, there is no need to 
     # gathering. 
