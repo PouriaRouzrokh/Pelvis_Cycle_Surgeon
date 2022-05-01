@@ -3,6 +3,7 @@
 #-------------------------------------------------------------------------------
 
 # Standard built-in modules
+from collections import OrderedDict
 import os
 import sys
 import warnings
@@ -46,11 +47,11 @@ class DiscConvBLock(nn.Module):
             stride (int): stride of the convolution.
         """
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=4, 
-                      stride=stride, padding=1, padding_mode='reflect'),
-            nn.InstanceNorm2d(out_channels),
-            nn.LeakyReLU(0.2),
+        self.conv = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(in_channels, out_channels, kernel_size=4, 
+                      stride=stride, padding=1, padding_mode='reflect')),
+            ('norm', nn.InstanceNorm2d(out_channels)),
+            ('act', nn.LeakyReLU(0.2)),])
         )
         
     def forward(self, x):
@@ -83,26 +84,27 @@ class Discriminator(nn.Module):
         super().__init__()
         
         # The initial layer which does not have instance norm.
-        self.initial_conv = nn.Sequential(
-            nn.Conv2d(in_channels, features[0], kernel_size=4, stride=2, 
-                      padding=1, padding_mode='reflect'),
-            nn.LeakyReLU(0.2),
-        )
+        layers = OrderedDict([
+            ('base_conv', nn.Conv2d(in_channels, features[0], kernel_size=4, 
+                                stride=2, padding=1, padding_mode='reflect')),
+            ('base_act', nn.LeakyReLU(0.2))
+        ])
         
         # All other layers.
-        layers = list()
         in_channels = features[0]
-        for feature in features[1:]:
-            layers.append(DiscConvBLock(in_channels, 
-                                          feature, 
-                                          stride = 1 if feature==features[-1] \
-                                              else 2))
+        for i, feature in enumerate(features[1:]):
+            layers.update(
+                {f'block{i+1}':
+                    DiscConvBLock(in_channels, feature, 
+                                stride = 1 if feature==features[-1] else 2)})
             in_channels = feature
         
         # Adding a final layer and stacking all layers as the final model.
-        layers.append(nn.Conv2d(in_channels, 1, kernel_size=4, stride=1,
-                                padding=1, padding_mode='reflect'))
-        self.model= nn.Sequential(*layers)
+        layers.update(
+            {'last_conv': nn.Conv2d(in_channels, 1, kernel_size=4, stride=1,
+                                     padding=1, padding_mode='reflect')}
+        )
+        self.model= nn.Sequential(layers)
         
     def forward(self, x):
         """ Forward pass.
@@ -113,7 +115,6 @@ class Discriminator(nn.Module):
         Returns:
           output (torch.Tensor): output tensor.
         """
-        x = self.initial_conv(x)
         output = torch.sigmoid(self.model(x))
         return output
     

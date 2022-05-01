@@ -22,6 +22,7 @@ import wandb
 
 # Local modules
 import datasets
+import losses
 from models import cycle_gan
 from models import custom_discriminators
 import schedulers
@@ -54,7 +55,7 @@ parser_arguments = {
     },
     
     'exp_name': {
-        'default': 'lr_search', 
+        'default': 'scheduler search', 
         'type': str, 
         'help': 'Name of the experiment.',
         'action': 'store'
@@ -68,7 +69,7 @@ parser_arguments = {
     },
     
     'run_notes': {
-        'default': 'Added LR scheduler: CosineAnnealingWarmupRestarts.'
+        'default': 'sample run - constant learning rate of 0.001'
                    'Generator: EfficientNet-B0, Discriminator: CycleGAN.', 
         'type': str, 
         'help': 'What that was tried in this run.',
@@ -96,7 +97,7 @@ parser_arguments = {
     # - G: Training hyperparameters
 
     'epochs': {
-        'default': 200, 
+        'default': 400, 
         'type': int, 
         'help': 'Number of total epochs to run.',
         'action': 'store'
@@ -110,20 +111,20 @@ parser_arguments = {
     },
     
     'batch_size': {
-        'default': 128, 
+        'default': 32, 
         'type': int, 
         'help': 'Mini-batch size.',
         'action': 'store'
     },
 
     'lr': {
-        'default': 2e-4, 
+        'default': 1e-4, 
         'type': float, 
         'help': 'Initial learning rate.',
         'action': 'store'
     },
     
-    'lambda_cycle': {'default': 1.0, 
+    'lambda_cycle': {'default': 2.0, 
                      'type': float, 
                      'help': 'Cycle loss weight.', 
                      'action': 'store'
@@ -135,6 +136,12 @@ parser_arguments = {
                         'action': 'store'
     },
     
+    'lambda_perceptual': {'default': 0.0,
+                          'type': float, 
+                          'help': 'perceptual loss weight.', 
+                          'action': 'store'
+    },
+    
     'weight_decay': {
         'default': 0.0, 
         'type': float, 
@@ -143,13 +150,13 @@ parser_arguments = {
     },
     
     'use_scheduler': {
-        'default': True, 
+        'default': False, 
         'help': 'To use a learning rate scheduler.',
         'action': 'store_true'
     },
     
     'early_stop_patience': {
-        'default': 1000, 
+        'default': 1e+10, 
         'type': int, 
         'help': 'Number of epochs to wait before early stopping.',
         'action': 'store'
@@ -180,14 +187,14 @@ parser_arguments = {
     # - G: GPU configurations 
 
     'parallel_mode': {
-        'default': 'ddp', 
+        'default': 'None', 
         'type': str, 
         'help': 'Parallel model. values could be "ddp", "dp", or None.',
         'action': 'store'
     },
 
     'gpu': {
-        'default': None, 
+        'default': 0, 
         'type': int, 
         'help': 'GPU id to use for training; e.g., 0.',
         'action': 'store'
@@ -235,7 +242,7 @@ parser_arguments = {
     },
 
     'master_port': {
-        'default': "29500", 
+        'default': "6006",
         'type': str, 
         'help': 'The port number for the host node.',
         'action': 'store'
@@ -396,7 +403,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
         is_base_rank = args.gpu == 0
         is_ddp = True
         store = torch.distributed.TCPStore(host_name = args.master_addr, 
-                                           port = 1234,
+                                           port = int(args.master_port),
                                            world_size = -1, 
                                            is_master = is_base_rank)
         # Set the base stores.
@@ -461,6 +468,8 @@ def main_worker(gpu: int, args: argparse.Namespace):
     if is_ddp: 
         train_sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dataset)
+    else:
+        train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size,
@@ -471,7 +480,7 @@ def main_worker(gpu: int, args: argparse.Namespace):
         drop_last=True)
 
     if is_base_rank:
-        print('The dataloaders are built.')
+        print(f'The dataloaders are built with length: {len(train_loader)}.')
 
     #---------------------------------------
     #-- Loss functions
@@ -483,6 +492,12 @@ def main_worker(gpu: int, args: argparse.Namespace):
             loss_fn.cuda()
         else:
             loss_fn.cuda(args.gpu) 
+    perceptual_loss = losses.VGG_PerceptualLoss(
+        device = 'cuda' if args.gpu is None \
+            else torch.device(f'cuda:{args.gpu}'),
+        style_weight=0.000001
+        ) 
+    loss_fns.append(perceptual_loss)
     
     #---------------------------------------
     #-- Optimizer & scheduler
@@ -502,21 +517,19 @@ def main_worker(gpu: int, args: argparse.Namespace):
     
     # If no scheduler is needed, keep the lr constant during the training.
     if args.use_scheduler:
-        sched_gen = schedulers.CosineAnnealingWarmupRestarts(
+        sched_gen = torch.optim.lr_scheduler.OneCycleLR(
             optimizer = opt_gen,
-            first_cycle_steps = 10,
-            cycle_mult = 1,
             max_lr = args.lr,
-            min_lr = 1e-5,
-            warmup_steps = 0,
+            div_factor = 5,
+            final_div_factor = 500,
+            total_steps = len(train_loader) * args.epochs
         )
-        sched_disc = schedulers.CosineAnnealingWarmupRestarts(
+        sched_disc = torch.optim.lr_scheduler.OneCycleLR(
             optimizer = opt_disc,
-            first_cycle_steps = 10,
-            cycle_mult = 1,
-            max_lr = args.lr,
-            min_lr = 1e-5,
-            warmup_steps = 0,
+            max_lr = args.lr / 2,
+            div_factor = 5,
+            final_div_factor = 500,
+            total_steps = len(train_loader) * args.epochs
         )  
     else:
         sched_gen = None
@@ -622,8 +635,9 @@ def main_worker(gpu: int, args: argparse.Namespace):
             if store.get('early_stop') == 'enabled':
                 break
         
-        # Adjust the learning rate in each epoch, if needed.
-        # scheduelr.step()
+        # Adjust the loss weights if needed.
+        # if epoch > ((args.epochs - args.start_epoch)  // 2):
+        #     args.lambda_perceptual = 0.1
         
         # Sync all the processes at the end of the epoch.
         ddp_utils.barrier(is_ddp)
@@ -703,7 +717,7 @@ def train_one_epoch(train_loader: Iterable,
     # Set up the training loop.
     for model in [disc_pre, disc_post, gen_pre, gen_post]:
         model.train()
-    loss_fn1, loss_fn2 = loss_fns
+    loss_fn1, loss_fn2, perceptual_loss = loss_fns
     if is_base_rank:
         pbar = tqdm(total=len(train_loader), desc=f'Training', unit='batch')
     if args.log_freq == -1:
@@ -749,11 +763,10 @@ def train_one_epoch(train_loader: Iterable,
         opt_disc.zero_grad()
         train_D_loss.backward()
         opt_disc.step()
-        if args.use_scheduler:
-            sched_disc.step()
         
         # Adjust the learning rate in each step, if needed.
-        # scheduler.step(epoch + i/len(train_loader))
+        if args.use_scheduler:
+            sched_disc.step()
         
         ############################### Train the generators.
         
@@ -775,23 +788,28 @@ def train_one_epoch(train_loader: Iterable,
         idendity_pre_loss = loss_fn1(identity_pre, real_pre)
         identity_post_loss = loss_fn1(identity_post, real_post)
         
+        # Perceptual loss.
+        G_pre_perceptual_loss = perceptual_loss(real_pre, fake_pre)
+        G_post_perceptual_loss = perceptual_loss(real_post, fake_post)
+        
         # Adding all the generator losses.
         train_G_loss = (G_pre_loss + 
                         G_post_loss +
                         cycle_pre_loss * args.lambda_cycle +
                         cycle_post_loss * args.lambda_cycle +
                         idendity_pre_loss * args.lambda_identity +
-                        identity_post_loss * args.lambda_identity)
+                        identity_post_loss * args.lambda_identity +
+                        G_pre_perceptual_loss * args.lambda_perceptual + 
+                        G_post_perceptual_loss * args.lambda_perceptual)
         
         # Optimize the generators.
         opt_gen.zero_grad()
         train_G_loss.backward()
         opt_gen.step()
-        if args.use_scheduler:
-            sched_gen.step()
         
         # Adjust the learning rate in each step, if needed.
-        # scheduler.step(epoch + i/len(train_loader))
+        if args.use_scheduler:
+            sched_gen.step()
         
         ###############################
         
@@ -826,6 +844,8 @@ def train_one_epoch(train_loader: Iterable,
                     'cycle_post_loss': cycle_post_loss.item(),
                     'idendity_pre_loss': idendity_pre_loss.item(),
                     'identity_post_loss': identity_post_loss.item(),
+                    'perceptual_pre_loss': G_pre_perceptual_loss.item(),
+                    'perceptual_post_loss': G_post_perceptual_loss.item(),
                     'D_pre_loss': D_pre_loss.item(),
                     'D_post_loss': D_post_loss.item(),
                     'train_step_G_loss': train_G_loss.item(),
